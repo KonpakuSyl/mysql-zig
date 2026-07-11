@@ -2,3 +2,4 @@
 zig-out/
 *.dump
 *.dump.tmp
+*.log
