@@ -132,7 +132,7 @@ const SelectStmt = struct {
     where_expr: ?*const Expr = null,
     group_by: []const *const Expr = &.{},
     having: ?*const Expr = null,
-    order_by: ?OrderBy,
+    order_by: []const OrderBy = &.{},
     limit: ?Limit,
 };
 
@@ -639,8 +639,12 @@ fn selectQuery(allocator: std.mem.Allocator, db: *storage.Storage, stmt: SelectS
     const contexts = try collectContexts(temp, db, table, stmt);
     var sorted = try allocator.dupe(RowContext, contexts);
     defer allocator.free(sorted);
-    if (stmt.order_by) |order| {
-        std.sort.insertion(RowContext, sorted, SortExprContext{ .allocator = temp, .expr = resolveOrderExpr(stmt, order.expr), .desc = order.desc }, rowContextLessThan);
+    if (stmt.order_by.len != 0) {
+        const orders = try temp.alloc(OrderBy, stmt.order_by.len);
+        for (stmt.order_by, 0..) |order, i| {
+            orders[i] = .{ .expr = resolveOrderExpr(stmt, order.expr), .desc = order.desc };
+        }
+        std.sort.insertion(RowContext, sorted, SortExprContext{ .allocator = temp, .orders = orders }, rowContextLessThan);
     }
 
     if (hasAggregates(stmt.items) or stmt.group_by.len != 0) {
@@ -1026,15 +1030,17 @@ fn appendStarValues(allocator: std.mem.Allocator, ctx: RowContext, values: []?[]
 
 const SortExprContext = struct {
     allocator: std.mem.Allocator,
-    expr: *const Expr,
-    desc: bool,
+    orders: []const OrderBy,
 };
 
 fn rowContextLessThan(ctx: SortExprContext, lhs: RowContext, rhs: RowContext) bool {
-    const l = evalExpr(ctx.allocator, lhs, ctx.expr, null) catch .null;
-    const r = evalExpr(ctx.allocator, rhs, ctx.expr, null) catch .null;
-    const cmp = compareValues(l, r);
-    return if (ctx.desc) cmp > 0 else cmp < 0;
+    for (ctx.orders) |order| {
+        const l = evalExpr(ctx.allocator, lhs, order.expr, null) catch .null;
+        const r = evalExpr(ctx.allocator, rhs, order.expr, null) catch .null;
+        const cmp = compareValues(l, r);
+        if (cmp != 0) return if (order.desc) cmp > 0 else cmp < 0;
+    }
+    return false;
 }
 
 fn evalExpr(allocator: std.mem.Allocator, ctx: RowContext, expr: *const Expr, group: ?AggregateGroup) anyerror!storage.Value {
@@ -2436,7 +2442,7 @@ const Parser = struct {
         var where_expr: ?*const Expr = null;
         var group_by: []const *const Expr = &.{};
         var having: ?*const Expr = null;
-        var order_by: ?OrderBy = null;
+        var order_by: []const OrderBy = &.{};
         var limit: ?Limit = null;
         if (self.matchKeyword("from")) {
             table = try self.expectIdentLike();
@@ -2468,10 +2474,15 @@ const Parser = struct {
             if (self.matchKeyword("having")) having = try self.parseExpression();
             if (self.matchKeyword("order")) {
                 try self.expectKeyword("by");
-                const expr = try self.parseExpression();
-                var desc = false;
-                if (self.matchKeyword("desc")) desc = true else _ = self.matchKeyword("asc");
-                order_by = .{ .expr = expr, .desc = desc };
+                var orders = std.array_list.Managed(OrderBy).init(self.allocator);
+                while (true) {
+                    const expr = try self.parseExpression();
+                    var desc = false;
+                    if (self.matchKeyword("desc")) desc = true else _ = self.matchKeyword("asc");
+                    try orders.append(.{ .expr = expr, .desc = desc });
+                    if (!self.match(.comma)) break;
+                }
+                order_by = try orders.toOwnedSlice();
             }
             limit = try self.parseOptionalLimit();
         }
@@ -3589,4 +3600,25 @@ test "sql ddl constraints and unsigned extended types" {
         try std.testing.expectEqualStrings("mediumint unsigned", r.rows[0].values[0].?);
         r.deinit(allocator);
     }
+}
+
+test "select supports multiple order by expressions" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-order-by-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table game_versions (version varchar(16), white_device_only bool, small_update_type int, created_at int)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into game_versions values ('2.0', false, 1, 10), ('1.0', false, 1, 10), ('3.0', false, 4, 20)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "SELECT * FROM `game_versions` WHERE (white_device_only = false and small_update_type != 4) ORDER BY created_at DESC,`game_versions`.`version` ASC LIMIT 1");
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("1.0", r.rows[0].values[0].?);
 }
