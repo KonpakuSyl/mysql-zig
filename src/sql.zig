@@ -1111,6 +1111,10 @@ fn evalAggregate(allocator: std.mem.Allocator, name: []const u8, arg: ?*const Ex
 }
 
 fn evalCall(allocator: std.mem.Allocator, ctx: RowContext, name: []const u8, args: []const *const Expr, group: ?AggregateGroup) anyerror!storage.Value {
+    if (std.ascii.eqlIgnoreCase(name, "version")) {
+        if (args.len != 0) return error.BadFunctionArity;
+        return .{ .text = "8.0.46-mysqlzig" };
+    }
     if (std.ascii.eqlIgnoreCase(name, "now")) return .{ .datetime = "2026-07-07 00:00:00" };
     if (std.ascii.eqlIgnoreCase(name, "current_date")) return .{ .date = "2026-07-07" };
     if (std.ascii.eqlIgnoreCase(name, "lower") or std.ascii.eqlIgnoreCase(name, "upper")) {
@@ -3336,7 +3340,10 @@ test "sql extended types and syntax" {
     var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
     defer db.deinit();
 
-    var r = try execute(allocator, &db, "create table typed (id int, ok bool, score double, price decimal(10,2), name varchar(8), payload blob, d date, ts datetime)");
+    var r = try execute(allocator, &db, "SELECT VERSION()");
+    try std.testing.expectEqualStrings("8.0.46-mysqlzig", r.rows[0].values[0].?);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "create table typed (id int, ok bool, score double, price decimal(10,2), name varchar(8), payload blob, d date, ts datetime)");
     r.deinit(allocator);
     r = try execute(allocator, &db, "insert into typed values (1, true, 1.5, '12.30', 'alpha', 'bytes', '2026-07-07', '2026-07-07 12:00:00'), (2, false, 2.5, '3.14', 'beta', 'raw', '2026-07-08', '2026-07-08 13:00:00')");
     r.deinit(allocator);
