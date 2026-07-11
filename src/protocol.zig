@@ -111,8 +111,18 @@ pub const Connection = struct {
     }
 
     pub fn writeOk(self: *Connection) !void {
-        var payload: [7]u8 = .{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 };
-        try self.writeRaw(self.sequence, &payload);
+        try self.writeOkResult(0);
+    }
+
+    fn writeOkResult(self: *Connection, affected_rows: u64) !void {
+        var payload = std.array_list.Managed(u8).init(self.allocator);
+        defer payload.deinit();
+        try payload.append(0x00);
+        try appendLenEncU64(&payload, affected_rows);
+        try appendLenEncU64(&payload, 0);
+        try appendLe(u16, &payload, 0x0002);
+        try appendLe(u16, &payload, 0);
+        try self.writeRaw(self.sequence, payload.items);
         self.sequence +%= 1;
     }
 
@@ -130,7 +140,7 @@ pub const Connection = struct {
     pub fn writeResult(self: *Connection, result: sql.Result) !void {
         self.sequence = 1;
         if (result.kind == .ok) {
-            try self.writeOk();
+            try self.writeOkResult(result.affected_rows);
             return;
         }
         var col_count = std.array_list.Managed(u8).init(self.allocator);
@@ -180,7 +190,7 @@ pub const Connection = struct {
     pub fn writeBinaryResult(self: *Connection, result: sql.Result) !void {
         self.sequence = 1;
         if (result.kind == .ok) {
-            try self.writeOk();
+            try self.writeOkResult(result.affected_rows);
             return;
         }
         var col_count = std.array_list.Managed(u8).init(self.allocator);
@@ -421,6 +431,10 @@ fn readLe(comptime T: type, bytes: []const u8) T {
 }
 
 fn appendLenEncInt(out: *std.array_list.Managed(u8), value: usize) !void {
+    return appendLenEncU64(out, value);
+}
+
+fn appendLenEncU64(out: *std.array_list.Managed(u8), value: u64) !void {
     if (value < 251) {
         try out.append(@intCast(value));
     } else if (value <= 0xffff) {

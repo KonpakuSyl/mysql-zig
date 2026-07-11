@@ -14,6 +14,7 @@ pub const Result = struct {
     kind: enum { ok, rows },
     columns: []Column = &.{},
     rows: []Row = &.{},
+    affected_rows: u64 = 0,
 
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
         for (self.rows) |row| {
@@ -217,6 +218,10 @@ pub fn execute(allocator: std.mem.Allocator, db: *storage.Storage, query: []cons
 
 fn ok() Result {
     return .{ .kind = .ok };
+}
+
+fn okAffected(affected_rows: u64) Result {
+    return .{ .kind = .ok, .affected_rows = affected_rows };
 }
 
 fn createTable(db: *storage.Storage, name: []const u8, parsed: []const CreateColumn, indexes: []const CreateIndexDef, checks: []const CreateCheckDef, if_not_exists: bool) !Result {
@@ -487,6 +492,7 @@ fn validateCheckForValues(allocator: std.mem.Allocator, table: *const storage.Ta
 
 fn insertInto(db: *storage.Storage, stmt: InsertStmt) !Result {
     const table = db.findTable(stmt.table) orelse return error.UnknownTable;
+    var affected_rows: u64 = 0;
     for (stmt.rows) |raw_row| {
         var arena = std.heap.ArenaAllocator.init(db.allocator);
         defer arena.deinit();
@@ -514,9 +520,13 @@ fn insertInto(db: *storage.Storage, stmt: InsertStmt) !Result {
         try fillAndValidateInsert(scratch, table, values, provided);
         if (stmt.mode == .replace) {
             if (storage.Storage.findConflictRow(table, values)) |row_id| {
-                if (storage.Storage.findRowById(table, row_id)) |row| db.deleteRow(table, row);
+                if (storage.Storage.findRowById(table, row_id)) |row| {
+                    db.deleteRow(table, row);
+                    affected_rows += 1;
+                }
             }
             _ = try db.insertRow(table, values);
+            affected_rows += 1;
             continue;
         }
         if (stmt.on_duplicate.len != 0) {
@@ -524,7 +534,9 @@ fn insertInto(db: *storage.Storage, stmt: InsertStmt) !Result {
                 const row = storage.Storage.findRowById(table, row_id) orelse continue;
                 const assignments = try buildDuplicateAssignments(scratch, table, row, stmt.on_duplicate, values);
                 try validateAssignments(scratch, table, row, assignments);
+                const changed = assignmentsChangeRow(row, assignments);
                 try db.updateRow(table, row, assignments);
+                if (changed) affected_rows += 2;
                 continue;
             }
         }
@@ -532,8 +544,16 @@ fn insertInto(db: *storage.Storage, stmt: InsertStmt) !Result {
             error.UniqueConstraintViolation => if (stmt.mode == .ignore) continue else return err,
             else => return err,
         };
+        affected_rows += 1;
     }
-    return ok();
+    return okAffected(affected_rows);
+}
+
+fn assignmentsChangeRow(row: *const storage.Row, assignments: []const storage.Assignment) bool {
+    for (assignments) |assignment| {
+        if (compareValues(row.values[assignment.column_index], assignment.value) != 0) return true;
+    }
+    return false;
 }
 
 fn buildDuplicateAssignments(allocator: std.mem.Allocator, table: *const storage.Table, row: *const storage.Row, parsed: []const AssignmentAst, incoming: []const storage.Value) ![]storage.Assignment {
@@ -564,16 +584,19 @@ fn updateRows(allocator: std.mem.Allocator, db: *storage.Storage, stmt: UpdateSt
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
+    var affected_rows: u64 = 0;
 
     for (row_ids) |row_id| {
         const row = storage.Storage.findRowById(table, row_id) orelse continue;
         if (!row.deleted and try rowMatches(allocator, table, row, stmt.conditions, stmt.where_expr)) {
             const assignments = try buildUpdateAssignments(scratch, table, row, stmt.assignments);
             try validateAssignments(scratch, table, row, assignments);
+            const changed = assignmentsChangeRow(row, assignments);
             try db.updateRow(table, row, assignments);
+            if (changed) affected_rows += 1;
         }
     }
-    return ok();
+    return okAffected(affected_rows);
 }
 
 fn buildUpdateAssignments(allocator: std.mem.Allocator, table: *const storage.Table, row: *const storage.Row, parsed: []const AssignmentAst) ![]storage.Assignment {
@@ -603,7 +626,7 @@ fn deleteFrom(allocator: std.mem.Allocator, db: *storage.Storage, stmt: DeleteSt
             }
         }
     }
-    return ok();
+    return okAffected(@intCast(deleted));
 }
 
 fn selectQuery(allocator: std.mem.Allocator, db: *storage.Storage, stmt: SelectStmt) !Result {
@@ -3354,6 +3377,13 @@ test "sql extended types and syntax" {
     r = try execute(allocator, &db, "create table typed (id int, ok bool, score double, price decimal(10,2), name varchar(8), payload blob, d date, ts datetime)");
     r.deinit(allocator);
     r = try execute(allocator, &db, "insert into typed values (1, true, 1.5, '12.30', 'alpha', 'bytes', '2026-07-07', '2026-07-07 12:00:00'), (2, false, 2.5, '3.14', 'beta', 'raw', '2026-07-08', '2026-07-08 13:00:00')");
+    try std.testing.expectEqual(@as(u64, 2), r.affected_rows);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "update typed set score = 1.5 where id = 1");
+    try std.testing.expectEqual(@as(u64, 0), r.affected_rows);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "update typed set score = 3.5 where id = 1");
+    try std.testing.expectEqual(@as(u64, 1), r.affected_rows);
     r.deinit(allocator);
     r = try execute(allocator, &db, "select count(*) as c from typed where name like 'a%'");
     try std.testing.expectEqualStrings("1", r.rows[0].values[0].?);
@@ -3369,6 +3399,9 @@ test "sql extended types and syntax" {
     r = try execute(allocator, &db, "select name from typed where id not in (1) order by name asc");
     try std.testing.expectEqual(@as(usize, 1), r.rows.len);
     try std.testing.expectEqualStrings("beta", r.rows[0].values[0].?);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "delete from typed where id = 2 limit 1");
+    try std.testing.expectEqual(@as(u64, 1), r.affected_rows);
     r.deinit(allocator);
     r = try execute(allocator, &db, "describe typed");
     try std.testing.expectEqualStrings("varchar(8)", r.rows[4].values[1].?);
