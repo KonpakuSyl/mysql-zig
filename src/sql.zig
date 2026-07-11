@@ -739,6 +739,7 @@ fn simpleIndexedPredicate(table: *const storage.Table, expr: *const Expr) ?Index
 fn informationSchemaTable(allocator: std.mem.Allocator, db: *storage.Storage, name: []const u8) !?*storage.Table {
     if (!startsWith(name, "information_schema.")) return null;
     const short = name["information_schema.".len..];
+    if (std.ascii.eqlIgnoreCase(short, "schemata")) return try buildInformationSchemaSchemata(allocator);
     if (std.ascii.eqlIgnoreCase(short, "tables")) return try buildInformationSchemaTables(allocator, db);
     if (std.ascii.eqlIgnoreCase(short, "columns")) return try buildInformationSchemaColumns(allocator, db);
     if (std.ascii.eqlIgnoreCase(short, "statistics")) return try buildInformationSchemaStatistics(allocator, db);
@@ -765,6 +766,12 @@ fn appendVirtualRow(allocator: std.mem.Allocator, table: *storage.Table, values:
     try table.rows.append(.{ .id = @intCast(table.rows.items.len + 1), .values = row_values });
 }
 
+fn buildInformationSchemaSchemata(allocator: std.mem.Allocator) !*storage.Table {
+    const table = try makeVirtualTable(allocator, "information_schema.schemata", &.{"SCHEMA_NAME"});
+    try appendVirtualRow(allocator, table, &.{.{ .text = "main" }});
+    return table;
+}
+
 fn buildInformationSchemaTables(allocator: std.mem.Allocator, db: *storage.Storage) !*storage.Table {
     const table = try makeVirtualTable(allocator, "information_schema.tables", &.{ "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE" });
     for (db.tables.items) |t| try appendVirtualRow(allocator, table, &.{ .{ .text = "main" }, .{ .text = t.name }, .{ .text = "BASE TABLE" } });
@@ -772,7 +779,7 @@ fn buildInformationSchemaTables(allocator: std.mem.Allocator, db: *storage.Stora
 }
 
 fn buildInformationSchemaColumns(allocator: std.mem.Allocator, db: *storage.Storage) !*storage.Table {
-    const table = try makeVirtualTable(allocator, "information_schema.columns", &.{ "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "CHARACTER_MAXIMUM_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "COLUMN_COMMENT" });
+    const table = try makeVirtualTable(allocator, "information_schema.columns", &.{ "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "CHARACTER_MAXIMUM_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "COLUMN_COMMENT", "DATETIME_PRECISION" });
     for (db.tables.items) |t| {
         for (t.columns, 0..) |col, i| {
             const kind_name = try columnTypeNameAlloc(allocator, col);
@@ -797,6 +804,7 @@ fn buildInformationSchemaColumns(allocator: std.mem.Allocator, db: *storage.Stor
                 if (numeric_precision) |v| .{ .text = v } else .null,
                 if (numeric_scale) |v| .{ .text = v } else .null,
                 .{ .text = "" },
+                .null,
             });
         }
     }
@@ -3452,6 +3460,16 @@ test "sql small app completeness features" {
 
         r = try execute(allocator, &db, "select table_name from information_schema.tables where table_name = 'users'");
         try std.testing.expectEqualStrings("users", r.rows[0].values[0].?);
+        r.deinit(allocator);
+        r = try execute(allocator, &db, "SELECT SCHEMA_NAME from Information_schema.SCHEMATA where SCHEMA_NAME LIKE 'main%' ORDER BY SCHEMA_NAME='main' DESC limit 1");
+        try std.testing.expectEqualStrings("main", r.rows[0].values[0].?);
+        r.deinit(allocator);
+        r = try execute(allocator, &db, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'users' AND table_type = 'BASE TABLE'");
+        try std.testing.expectEqualStrings("1", r.rows[0].values[0].?);
+        r.deinit(allocator);
+        r = try execute(allocator, &db, "SELECT column_name, column_default, is_nullable = 'YES', data_type, character_maximum_length, column_type, column_key, extra, column_comment, numeric_precision, numeric_scale, datetime_precision FROM information_schema.columns WHERE table_schema = 'main' AND table_name = 'users' ORDER BY ordinal_position");
+        try std.testing.expectEqualStrings("id", r.rows[0].values[0].?);
+        try std.testing.expect(r.rows[0].values[11] == null);
         r.deinit(allocator);
         r = try execute(allocator, &db, "describe users");
         try std.testing.expectEqualStrings("PRI", r.rows[0].values[3].?);

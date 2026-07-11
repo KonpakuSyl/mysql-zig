@@ -112,7 +112,7 @@ pub const Server = struct {
         var prepared = std.AutoHashMap(u32, PreparedStatement).init(self.allocator);
         defer {
             var it = prepared.valueIterator();
-            while (it.next()) |stmt| self.allocator.free(stmt.query);
+            while (it.next()) |stmt| stmt.deinit(self.allocator);
             prepared.deinit();
         }
         var next_statement_id: u32 = 1;
@@ -201,17 +201,16 @@ pub const Server = struct {
                     const query = packet.payload[1..];
                     const statement_id = next_statement_id;
                     next_statement_id +%= 1;
-                    const query_copy = self.allocator.dupe(u8, query) catch |err| {
+                    var stmt = PreparedStatement.init(self.allocator, query) catch |err| {
                         conn.writeErr(1064, @errorName(err)) catch {};
                         continue;
                     };
-                    const param_count = countPlaceholders(query);
-                    prepared.put(statement_id, .{ .query = query_copy, .param_count = param_count }) catch |err| {
-                        self.allocator.free(query_copy);
+                    prepared.put(statement_id, stmt) catch |err| {
+                        stmt.deinit(self.allocator);
                         conn.writeErr(1064, @errorName(err)) catch {};
                         continue;
                     };
-                    conn.writePrepareOk(statement_id, param_count) catch return;
+                    conn.writePrepareOk(statement_id, stmt.param_count) catch return;
                 },
                 protocol.command_stmt_execute => {
                     const exec = parseStmtExecute(self.allocator, packet.payload, &prepared) catch |err| {
@@ -236,11 +235,20 @@ pub const Server = struct {
                 protocol.command_stmt_close => {
                     if (packet.payload.len >= 5) {
                         const statement_id = readLe(u32, packet.payload[1..5]);
-                        if (prepared.fetchRemove(statement_id)) |entry| self.allocator.free(entry.value.query);
+                        if (prepared.fetchRemove(statement_id)) |entry| {
+                            var stmt = entry.value;
+                            stmt.deinit(self.allocator);
+                        }
                     }
                 },
-                protocol.command_stmt_reset => conn.writeOk() catch return,
-                protocol.command_stmt_send_long_data => {},
+                protocol.command_stmt_reset => {
+                    resetPreparedStatement(&prepared, packet.payload) catch |err| {
+                        conn.writeErr(1064, @errorName(err)) catch {};
+                        continue;
+                    };
+                    conn.writeOk() catch return;
+                },
+                protocol.command_stmt_send_long_data => appendStmtLongData(self.allocator, &prepared, packet.payload) catch return,
                 else => conn.writeErr(1047, "unsupported command") catch return,
             }
         }
@@ -250,7 +258,50 @@ pub const Server = struct {
 const PreparedStatement = struct {
     query: []u8,
     param_count: usize,
+    param_types: ?[]u8 = null,
+    long_data: []?std.array_list.Managed(u8),
+
+    fn init(allocator: std.mem.Allocator, query: []const u8) !PreparedStatement {
+        const query_copy = try allocator.dupe(u8, query);
+        errdefer allocator.free(query_copy);
+        const param_count = countPlaceholders(query);
+        const long_data = try allocator.alloc(?std.array_list.Managed(u8), param_count);
+        @memset(long_data, null);
+        return .{ .query = query_copy, .param_count = param_count, .long_data = long_data };
+    }
+
+    fn clearLongData(self: *PreparedStatement) void {
+        for (self.long_data) |*slot| {
+            if (slot.*) |*data| data.deinit();
+            slot.* = null;
+        }
+    }
+
+    fn deinit(self: *PreparedStatement, allocator: std.mem.Allocator) void {
+        self.clearLongData();
+        allocator.free(self.long_data);
+        if (self.param_types) |types| allocator.free(types);
+        allocator.free(self.query);
+        self.* = undefined;
+    }
 };
+
+fn appendStmtLongData(allocator: std.mem.Allocator, prepared: *std.AutoHashMap(u32, PreparedStatement), payload: []const u8) !void {
+    if (payload.len < 7) return error.MalformedStmtLongData;
+    const statement_id = readLe(u32, payload[1..5]);
+    const param_id = readLe(u16, payload[5..7]);
+    const stmt = prepared.getPtr(statement_id) orelse return error.UnknownStatement;
+    if (param_id >= stmt.param_count) return error.ParameterIndexOutOfRange;
+    if (stmt.long_data[param_id] == null) stmt.long_data[param_id] = std.array_list.Managed(u8).init(allocator);
+    try stmt.long_data[param_id].?.appendSlice(payload[7..]);
+}
+
+fn resetPreparedStatement(prepared: *std.AutoHashMap(u32, PreparedStatement), payload: []const u8) !void {
+    if (payload.len < 5) return error.MalformedStmtReset;
+    const statement_id = readLe(u32, payload[1..5]);
+    const stmt = prepared.getPtr(statement_id) orelse return error.UnknownStatement;
+    stmt.clearLongData();
+}
 
 fn countPlaceholders(query: []const u8) usize {
     var count: usize = 0;
@@ -278,7 +329,8 @@ fn countPlaceholders(query: []const u8) usize {
 fn parseStmtExecute(allocator: std.mem.Allocator, payload: []const u8, prepared: *std.AutoHashMap(u32, PreparedStatement)) ![]u8 {
     if (payload.len < 10) return error.MalformedStmtExecute;
     const statement_id = readLe(u32, payload[1..5]);
-    const stmt = prepared.get(statement_id) orelse return error.UnknownStatement;
+    const stmt = prepared.getPtr(statement_id) orelse return error.UnknownStatement;
+    defer stmt.clearLongData();
     var pos: usize = 10;
     var params = std.array_list.Managed([]u8).init(allocator);
     defer {
@@ -293,10 +345,15 @@ fn parseStmtExecute(allocator: std.mem.Allocator, payload: []const u8, prepared:
         pos += null_bitmap_len;
         const new_params_bound = payload[pos];
         pos += 1;
-        if (new_params_bound == 0) return error.UnsupportedStmtExecute;
-        if (pos + stmt.param_count * 2 > payload.len) return error.MalformedStmtExecute;
-        const types = payload[pos .. pos + stmt.param_count * 2];
-        pos += stmt.param_count * 2;
+        const types = if (new_params_bound != 0) blk: {
+            const types_len = stmt.param_count * 2;
+            if (pos + types_len > payload.len) return error.MalformedStmtExecute;
+            const new_types = try allocator.dupe(u8, payload[pos .. pos + types_len]);
+            if (stmt.param_types) |old_types| allocator.free(old_types);
+            stmt.param_types = new_types;
+            pos += types_len;
+            break :blk stmt.param_types.?;
+        } else stmt.param_types orelse return error.MissingStmtParamTypes;
 
         var i: usize = 0;
         while (i < stmt.param_count) : (i += 1) {
@@ -307,7 +364,10 @@ fn parseStmtExecute(allocator: std.mem.Allocator, payload: []const u8, prepared:
             }
             const typ = types[i * 2];
             const unsigned = (types[i * 2 + 1] & 0x80) != 0;
-            const decoded = try decodeStmtParam(allocator, payload, &pos, typ, unsigned);
+            const decoded = if (stmt.long_data[i]) |data|
+                try quoteSqlString(allocator, data.items)
+            else
+                try decodeStmtParam(allocator, payload, &pos, typ, unsigned);
             try params.append(decoded);
         }
     }
@@ -454,4 +514,42 @@ fn mysqlErrorCode(err: anyerror) u16 {
         error.UniqueConstraintViolation => 1062,
         else => 1064,
     };
+}
+
+test "prepared statement long data is accumulated and cleared" {
+    const allocator = std.testing.allocator;
+    var prepared = std.AutoHashMap(u32, PreparedStatement).init(allocator);
+    defer {
+        var it = prepared.valueIterator();
+        while (it.next()) |stmt| stmt.deinit(allocator);
+        prepared.deinit();
+    }
+
+    try prepared.put(1, try PreparedStatement.init(allocator, "insert into game_config (content,id) values (?,?)"));
+    const first_chunk = [_]u8{ 0x18, 1, 0, 0, 0, 0, 0, 'l', 'a', 'r', 'g', 'e', ' ' };
+    const second_chunk = [_]u8{ 0x18, 1, 0, 0, 0, 0, 0, 'j', 's', 'o', 'n' };
+    try appendStmtLongData(allocator, &prepared, &first_chunk);
+    try appendStmtLongData(allocator, &prepared, &second_chunk);
+
+    const execute_with_types = [_]u8{
+        0x17, 1, 0, 0, 0, 0, 1, 0, 0, 0,
+        0,    1, 0xfd, 0, 0x03, 0, 7, 0, 0, 0,
+    };
+    const sql_with_long_data = try parseStmtExecute(allocator, &execute_with_types, &prepared);
+    defer allocator.free(sql_with_long_data);
+    try std.testing.expectEqualStrings("insert into game_config (content,id) values ('large json',7)", sql_with_long_data);
+    try std.testing.expect(prepared.getPtr(1).?.long_data[0] == null);
+
+    const execute_reusing_types = [_]u8{
+        0x17, 1, 0, 0, 0, 0, 1, 0, 0, 0,
+        0,    0, 1,    'x', 8,    0, 0, 0,
+    };
+    const sql_reusing_types = try parseStmtExecute(allocator, &execute_reusing_types, &prepared);
+    defer allocator.free(sql_reusing_types);
+    try std.testing.expectEqualStrings("insert into game_config (content,id) values ('x',8)", sql_reusing_types);
+
+    try appendStmtLongData(allocator, &prepared, &first_chunk);
+    const reset = [_]u8{ 0x1a, 1, 0, 0, 0 };
+    try resetPreparedStatement(&prepared, &reset);
+    try std.testing.expect(prepared.getPtr(1).?.long_data[0] == null);
 }
