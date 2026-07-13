@@ -3622,3 +3622,27 @@ test "select supports multiple order by expressions" {
     try std.testing.expectEqual(@as(usize, 1), r.rows.len);
     try std.testing.expectEqualStrings("1.0", r.rows[0].values[0].?);
 }
+
+test "select uses a single-column index outside the first table column" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-non-first-index-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
+    defer db.deinit();
+
+    var r = try execute(allocator, &db, "create table white_devices (id int primary key, name varchar(32), device_id varchar(64), is_delete bool, unique index did (device_id))");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into white_devices values (1, 'allowed', '', false), (2, 'deleted', 'old-device', true)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "SELECT * FROM white_devices WHERE (device_id = '' and is_delete = false) ORDER BY white_devices.id ASC LIMIT 1");
+    defer r.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("allowed", r.rows[0].values[1].?);
+}

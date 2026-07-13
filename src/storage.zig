@@ -381,7 +381,7 @@ pub const Storage = struct {
         _ = self;
         for (table.indexes.items) |*index| {
             if (index.columns.len == 1 and index.columns[0] == column_index) {
-                if (index.buckets.get(indexHashValues(index.*, &.{value}))) |bucket| return bucket.items;
+                if (index.buckets.get(indexHashProjectedValues(&.{value}))) |bucket| return bucket.items;
                 return &.{};
             }
         }
@@ -881,12 +881,20 @@ fn indexRemove(index: *Index, values: []const Value, row_id: RowId) void {
 
 fn indexHashValues(index: Index, values: []const Value) u64 {
     var hasher = std.hash.Wyhash.init(0x9e37_79b9_7f4a_7c15);
-    for (index.columns) |column_index| {
-        var buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &buf, valueHash(values[column_index]), .little);
-        hasher.update(&buf);
-    }
+    for (index.columns) |column_index| updateIndexHash(&hasher, values[column_index]);
     return hasher.final();
+}
+
+fn indexHashProjectedValues(values: []const Value) u64 {
+    var hasher = std.hash.Wyhash.init(0x9e37_79b9_7f4a_7c15);
+    for (values) |value| updateIndexHash(&hasher, value);
+    return hasher.final();
+}
+
+fn updateIndexHash(hasher: *std.hash.Wyhash, value: Value) void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, valueHash(value), .little);
+    hasher.update(&buf);
 }
 
 pub fn valueHash(value: Value) u64 {
