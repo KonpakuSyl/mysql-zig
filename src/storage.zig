@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const magic = "MZIGDMP1";
+const magic = "MZIGDUMP";
 
 pub const RowId = u64;
 
@@ -117,16 +117,15 @@ pub const Assignment = struct {
 pub const Storage = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    memory: []u8,
-    used: usize = 0,
+    byte_arena: std.heap.ArenaAllocator,
     dump_path: []const u8,
     tables: std.array_list.Managed(Table),
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, memory_size: usize, dump_path: []const u8) !Storage {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, dump_path: []const u8) !Storage {
         var storage = Storage{
             .allocator = allocator,
             .io = io,
-            .memory = try mapMemory(memory_size),
+            .byte_arena = .init(allocator),
             .dump_path = dump_path,
             .tables = std.array_list.Managed(Table).init(allocator),
         };
@@ -138,7 +137,7 @@ pub const Storage = struct {
     pub fn deinit(self: *Storage) void {
         for (self.tables.items) |*table| self.deinitTable(table);
         self.tables.deinit();
-        unmapMemory(self.memory);
+        self.byte_arena.deinit();
         self.* = undefined;
     }
 
@@ -146,8 +145,7 @@ pub const Storage = struct {
         var out = Storage{
             .allocator = self.allocator,
             .io = self.io,
-            .memory = try mapMemory(self.memory.len),
-            .used = 0,
+            .byte_arena = .init(self.allocator),
             .dump_path = self.dump_path,
             .tables = std.array_list.Managed(Table).init(self.allocator),
         };
@@ -197,7 +195,6 @@ pub const Storage = struct {
         var out = std.array_list.Managed(u8).init(self.allocator);
         defer out.deinit();
         try out.appendSlice(magic);
-        try appendLe(u64, &out, self.memory.len);
         try appendLe(u32, &out, @intCast(self.tables.items.len));
         for (self.tables.items) |table| {
             try appendString(&out, table.name);
@@ -300,7 +297,7 @@ pub const Storage = struct {
         var index = try Index.init(self.allocator, index_name, columns, unique or primary, primary);
         errdefer index.deinit();
         for (table.rows.items) |row| {
-            if (!row.deleted) try indexAdd(&index, row.values, row.id);
+            if (!row.deleted) try indexAdd(&index, table, row.values, row.id);
         }
         try table.indexes.append(index);
     }
@@ -346,7 +343,7 @@ pub const Storage = struct {
         table.next_row_id += 1;
         try table.rows.append(.{ .id = id, .values = values });
         const row = &table.rows.items[table.rows.items.len - 1];
-        for (table.indexes.items) |*index| try indexAdd(index, row.values, row.id);
+        for (table.indexes.items) |*index| try indexAdd(index, table, row.values, row.id);
         return id;
     }
 
@@ -365,7 +362,7 @@ pub const Storage = struct {
         const old_values = row.values;
         row.values = new_values;
         for (table.indexes.items) |*index| {
-            if (assignmentTouchesIndex(assignments, index)) try indexAdd(index, row.values, row.id);
+            if (assignmentTouchesIndex(assignments, index)) try indexAdd(index, table, row.values, row.id);
         }
         self.allocator.free(old_values);
     }
@@ -377,12 +374,19 @@ pub const Storage = struct {
         row.deleted = true;
     }
 
-    pub fn indexedLookup(self: *Storage, table: *Table, column_index: usize, value: Value) ?[]const RowId {
+    pub fn indexedLookup(self: *Storage, allocator: std.mem.Allocator, table: *Table, column_index: usize, value: Value) !?[]RowId {
         _ = self;
         for (table.indexes.items) |*index| {
             if (index.columns.len == 1 and index.columns[0] == column_index) {
-                if (index.buckets.get(indexHashProjectedValues(&.{value}))) |bucket| return bucket.items;
-                return &.{};
+                var matches = std.array_list.Managed(RowId).init(allocator);
+                defer matches.deinit();
+                if (index.buckets.get(indexHashProjectedValues(&.{value}))) |bucket| {
+                    for (bucket.items) |row_id| {
+                        const row = findRowById(table, row_id) orelse continue;
+                        if (!row.deleted and valueEqual(row.values[column_index], value)) try matches.append(row_id);
+                    }
+                }
+                return @as(?[]RowId, try matches.toOwnedSlice());
             }
         }
         return null;
@@ -393,10 +397,15 @@ pub const Storage = struct {
             if (!index.unique and !index.primary) continue;
             if (index.primary) {
                 for (index.columns) |column_index| if (values[column_index] == .null) return null;
+            } else if (indexContainsNull(index, values)) {
+                continue;
             }
             const hash = indexHashValues(index, values);
             if (index.buckets.get(hash)) |bucket| {
-                if (bucket.items.len > 0) return bucket.items[0];
+                for (bucket.items) |row_id| {
+                    const row = findRowByIdConst(table, row_id) orelse continue;
+                    if (!row.deleted and indexValuesEqual(index, row.values, values)) return row_id;
+                }
             }
         }
         return null;
@@ -541,20 +550,16 @@ pub const Storage = struct {
     }
 
     fn persistBytes(self: *Storage, bytes: []const u8) ![]const u8 {
-        const aligned = std.mem.alignForward(usize, self.used, 8);
-        if (aligned + bytes.len > self.memory.len) return error.OutOfMappedMemory;
-        @memcpy(self.memory[aligned .. aligned + bytes.len], bytes);
-        self.used = aligned + bytes.len;
-        return self.memory[aligned .. aligned + bytes.len];
+        return self.byte_arena.allocator().dupe(u8, bytes);
     }
 
     fn restore(self: *Storage) !void {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, self.dump_path, self.allocator, .limited(1024 * 1024 * 1024)) catch |err| switch (err) {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, self.dump_path, self.allocator, .unlimited) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer self.allocator.free(bytes);
-        if (bytes.len < 32 + magic.len + 8 + 4) return error.BadDump;
+        if (bytes.len < 32 + magic.len + 4) return error.BadDump;
         const expected: [32]u8 = bytes[0..32].*;
         var actual: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes[32..], &actual, .{});
@@ -562,9 +567,6 @@ pub const Storage = struct {
         var cur: usize = 32;
         if (!std.mem.eql(u8, bytes[cur .. cur + magic.len], magic)) return error.BadDump;
         cur += magic.len;
-        const dumped_memory_size = readLe(u64, bytes[cur .. cur + 8]);
-        cur += 8;
-        if (dumped_memory_size > self.memory.len) return error.DumpMemoryTooLarge;
         const table_count = readLe(u32, bytes[cur .. cur + 4]);
         cur += 4;
 
@@ -812,7 +814,7 @@ fn rebuildIndexes(table: *Table) !void {
     for (table.indexes.items) |*index| {
         clearIndexBuckets(index);
         for (table.rows.items) |row| {
-            if (!row.deleted) try indexAdd(index, row.values, row.id);
+            if (!row.deleted) try indexAdd(index, table, row.values, row.id);
         }
     }
 }
@@ -842,6 +844,44 @@ fn indexContainsColumn(index: Index, column_index: usize) bool {
     return false;
 }
 
+fn indexContainsNull(index: Index, values: []const Value) bool {
+    for (index.columns) |column_index| {
+        if (values[column_index] == .null) return true;
+    }
+    return false;
+}
+
+fn indexValuesEqual(index: Index, left: []const Value, right: []const Value) bool {
+    for (index.columns) |column_index| {
+        if (!valueEqual(left[column_index], right[column_index])) return false;
+    }
+    return true;
+}
+
+fn valueEqual(left: Value, right: Value) bool {
+    return switch (left) {
+        .null => right == .null,
+        .int => |value| right == .int and right.int == value,
+        .bool => |value| right == .bool and right.bool == value,
+        .real => |value| right == .real and @as(u64, @bitCast(right.real)) == @as(u64, @bitCast(value)),
+        .text => |value| right == .text and std.mem.eql(u8, right.text, value),
+        .decimal => |value| right == .decimal and std.mem.eql(u8, right.decimal, value),
+        .blob => |value| right == .blob and std.mem.eql(u8, right.blob, value),
+        .date => |value| right == .date and std.mem.eql(u8, right.date, value),
+        .datetime => |value| right == .datetime and std.mem.eql(u8, right.datetime, value),
+        .time => |value| right == .time and std.mem.eql(u8, right.time, value),
+        .year => |value| right == .year and right.year == value,
+        .json => |value| right == .json and std.mem.eql(u8, right.json, value),
+    };
+}
+
+fn findRowByIdConst(table: *const Table, id: RowId) ?*const Row {
+    for (table.rows.items) |*row| {
+        if (row.id == id) return row;
+    }
+    return null;
+}
+
 fn checkUniqueIndexes(table: *const Table, values: []const Value, updating_row_id: ?RowId) !void {
     for (table.indexes.items) |index| {
         if (!index.unique and !index.primary) continue;
@@ -849,21 +889,31 @@ fn checkUniqueIndexes(table: *const Table, values: []const Value, updating_row_i
             for (index.columns) |column_index| {
                 if (values[column_index] == .null) return error.NotNullViolation;
             }
+        } else if (indexContainsNull(index, values)) {
+            continue;
         }
         if (index.buckets.get(indexHashValues(index, values))) |bucket| {
             for (bucket.items) |row_id| {
                 if (updating_row_id != null and row_id == updating_row_id.?) continue;
-                return error.UniqueConstraintViolation;
+                const row = findRowByIdConst(table, row_id) orelse continue;
+                if (!row.deleted and indexValuesEqual(index, row.values, values)) return error.UniqueConstraintViolation;
             }
         }
     }
 }
 
-fn indexAdd(index: *Index, values: []const Value, row_id: RowId) !void {
+fn indexAdd(index: *Index, table: *const Table, values: []const Value, row_id: RowId) !void {
+    if (index.primary and indexContainsNull(index.*, values)) return error.NotNullViolation;
     const hash = indexHashValues(index.*, values);
     const result = try index.buckets.getOrPut(hash);
     if (!result.found_existing) result.value_ptr.* = std.array_list.Managed(RowId).init(index.buckets.allocator);
-    if (index.unique and result.value_ptr.items.len != 0) return error.UniqueConstraintViolation;
+    if (index.unique and (index.primary or !indexContainsNull(index.*, values))) {
+        for (result.value_ptr.items) |existing_id| {
+            if (existing_id == row_id) continue;
+            const existing = findRowByIdConst(table, existing_id) orelse continue;
+            if (!existing.deleted and indexValuesEqual(index.*, existing.values, values)) return error.UniqueConstraintViolation;
+        }
+    }
     try result.value_ptr.append(row_id);
 }
 
@@ -1048,14 +1098,6 @@ fn appendValue(out: *std.array_list.Managed(u8), value: Value) !void {
     }
 }
 
-fn mapMemory(size: usize) ![]u8 {
-    return std.heap.page_allocator.alloc(u8, size);
-}
-
-fn unmapMemory(bytes: []u8) void {
-    std.heap.page_allocator.free(bytes);
-}
-
 fn appendLe(comptime T: type, out: *std.array_list.Managed(u8), value: T) !void {
     var buf: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &buf, value, .little);
@@ -1090,7 +1132,7 @@ test "storage types truncate drop restore" {
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
     {
-        var storage = try Storage.init(allocator, io, 1024 * 1024, path);
+        var storage = try Storage.init(allocator, io, path);
         defer storage.deinit();
         try storage.createTable("typed", &.{
             .{ .name = "id", .kind = .int },
@@ -1114,18 +1156,61 @@ test "storage types truncate drop restore" {
             .{ .date = "2026-07-07" },
             .{ .datetime = "2026-07-07 12:00:00" },
         });
-        try std.testing.expectEqual(@as(usize, 1), storage.indexedLookup(table, 0, .{ .int = 1 }).?.len);
+        const first_hits = (try storage.indexedLookup(allocator, table, 0, .{ .int = 1 })).?;
+        defer allocator.free(first_hits);
+        try std.testing.expectEqual(@as(usize, 1), first_hits.len);
         try storage.flush();
     }
     {
-        var storage = try Storage.init(allocator, io, 1024 * 1024, path);
+        var storage = try Storage.init(allocator, io, path);
         defer storage.deinit();
         const table = storage.findTable("typed").?;
         try std.testing.expectEqual(@as(usize, 8), table.columns.len);
-        try std.testing.expectEqual(@as(usize, 1), storage.indexedLookup(table, 0, .{ .int = 1 }).?.len);
+        const restored_hits = (try storage.indexedLookup(allocator, table, 0, .{ .int = 1 })).?;
+        defer allocator.free(restored_hits);
+        try std.testing.expectEqual(@as(usize, 1), restored_hits.len);
         storage.truncateTable(table);
         try std.testing.expectEqual(@as(usize, 0), table.rows.items.len);
         try storage.dropTable("typed");
         try std.testing.expect(storage.findTable("typed") == null);
     }
+}
+
+test "unique indexes allow nulls and compare full keys inside hash buckets" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-unique-index-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var storage = try Storage.init(allocator, io, path);
+    defer storage.deinit();
+    try storage.createTable("items", &.{
+        .{ .name = "id", .kind = .int, .nullable = false },
+        .{ .name = "code", .kind = .int },
+    });
+    const table = storage.findTable("items").?;
+    try storage.createIndexEx(table, "uq_code", &.{1}, true, false);
+
+    _ = try storage.insertRow(table, &.{ .{ .int = 1 }, .null });
+    _ = try storage.insertRow(table, &.{ .{ .int = 2 }, .null });
+
+    const first_id = try storage.insertRow(table, &.{ .{ .int = 3 }, .{ .int = 10 } });
+    const index = &table.indexes.items[0];
+    const collision_hash = indexHashProjectedValues(&.{.{ .int = 20 }});
+    const collision = try index.buckets.getOrPut(collision_hash);
+    if (!collision.found_existing) collision.value_ptr.* = std.array_list.Managed(RowId).init(allocator);
+    var has_first = false;
+    for (collision.value_ptr.items) |row_id| has_first = has_first or row_id == first_id;
+    if (!has_first) try collision.value_ptr.append(first_id);
+
+    try std.testing.expect(Storage.findConflictRow(table, &.{ .{ .int = 4 }, .{ .int = 20 } }) == null);
+    const second_id = try storage.insertRow(table, &.{ .{ .int = 4 }, .{ .int = 20 } });
+    try std.testing.expectEqual(second_id, Storage.findConflictRow(table, &.{ .{ .int = 5 }, .{ .int = 20 } }).?);
+
+    const hits = (try storage.indexedLookup(allocator, table, 1, .{ .int = 20 })).?;
+    defer allocator.free(hits);
+    try std.testing.expectEqualSlices(RowId, &.{second_id}, hits);
 }

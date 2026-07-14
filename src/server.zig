@@ -6,10 +6,35 @@ const Storage = @import("storage.zig").Storage;
 pub const Config = struct {
     bind_host: []const u8 = "127.0.0.1",
     port: u16 = 3306,
-    memory_size: usize = 256 * 1024 * 1024,
     dump_path: []const u8 = "mysqlzig.dump",
     username: []const u8 = "root",
     password: []const u8 = "",
+};
+
+const ClientState = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    thread: ?std.Thread = null,
+    closed: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    lifecycle_lock: std.atomic.Mutex = .unlocked,
+
+    fn closeStream(self: *ClientState) void {
+        self.lockLifecycle();
+        defer self.lifecycle_lock.unlock();
+        if (!self.closed.swap(true, .acq_rel)) self.stream.close(self.io);
+    }
+
+    fn shutdown(self: *ClientState) void {
+        self.lockLifecycle();
+        defer self.lifecycle_lock.unlock();
+        if (self.closed.load(.acquire)) return;
+        self.stream.shutdown(self.io, .both) catch {};
+    }
+
+    fn lockLifecycle(self: *ClientState) void {
+        while (!self.lifecycle_lock.tryLock()) std.Thread.yield() catch {};
+    }
 };
 
 pub const Server = struct {
@@ -21,7 +46,9 @@ pub const Server = struct {
     storage: Storage = undefined,
     storage_ready: bool = false,
     storage_mutex: std.Io.Mutex = .init,
+    storage_version: u64 = 0,
     running: std.atomic.Value(bool) = .init(false),
+    clients: std.ArrayList(*ClientState) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Server {
         return .{
@@ -34,7 +61,7 @@ pub const Server = struct {
     pub fn start(self: *Server) !void {
         if (self.running.load(.acquire)) return error.AlreadyStarted;
         const io = self.io_threaded.io();
-        self.storage = try Storage.init(self.allocator, io, self.config.memory_size, self.config.dump_path);
+        self.storage = try Storage.init(self.allocator, io, self.config.dump_path);
         self.storage_ready = true;
         errdefer {
             self.storage.deinit();
@@ -43,20 +70,36 @@ pub const Server = struct {
 
         var addr = try std.Io.net.IpAddress.parse(self.config.bind_host, self.config.port);
         self.listener = try addr.listen(io, .{ .reuse_address = true });
+        errdefer {
+            self.listener.?.deinit(io);
+            self.listener = null;
+        }
         self.running.store(true, .release);
+        errdefer self.running.store(false, .release);
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
 
     pub fn stop(self: *Server) void {
-        if (!self.running.swap(false, .acq_rel)) return;
+        const was_running = self.running.swap(false, .acq_rel);
+        if (!was_running and self.accept_thread == null and self.clients.items.len == 0) return;
         const io = self.io_threaded.io();
+        self.storage_mutex.lockUncancelable(io);
         if (self.listener) |*listener| {
             listener.deinit(io);
+            self.listener = null;
         }
+        self.storage_mutex.unlock(io);
         if (self.accept_thread) |thread| {
             thread.join();
             self.accept_thread = null;
         }
+        for (self.clients.items) |client| client.shutdown();
+        for (self.clients.items) |client| {
+            if (client.thread) |thread| thread.join();
+            client.closeStream();
+            self.allocator.destroy(client);
+        }
+        self.clients.clearRetainingCapacity();
         self.storage_mutex.lockUncancelable(io);
         defer self.storage_mutex.unlock(io);
         self.storage.flush() catch |err| std.debug.print("mysqlzig dump flush failed: {s}\n", .{@errorName(err)});
@@ -79,43 +122,75 @@ pub const Server = struct {
             self.storage.deinit();
             self.storage_ready = false;
         }
+        self.clients.deinit(self.allocator);
         self.io_threaded.deinit();
     }
 
     fn acceptLoop(self: *Server) void {
         const io = self.io_threaded.io();
         while (self.running.load(.acquire)) {
+            self.reapClients();
             var stream = (self.listener orelse return).accept(io) catch |err| {
                 if (self.running.load(.acquire)) logConnectionError("accept", err);
                 break;
             };
-            const thread = std.Thread.spawn(.{}, handleClient, .{ self, stream }) catch |err| {
-                logConnectionError("spawn", err);
+            const client = self.allocator.create(ClientState) catch |err| {
+                logConnectionError("allocate client", err);
                 stream.close(io);
                 continue;
             };
-            thread.detach();
+            client.* = .{ .io = io, .stream = stream };
+            self.clients.append(self.allocator, client) catch |err| {
+                logConnectionError("register client", err);
+                client.closeStream();
+                self.allocator.destroy(client);
+                continue;
+            };
+            client.thread = std.Thread.spawn(.{}, handleClient, .{ self, client }) catch |err| {
+                logConnectionError("spawn", err);
+                _ = self.clients.pop();
+                client.closeStream();
+                self.allocator.destroy(client);
+                continue;
+            };
         }
     }
 
     fn requestShutdownFromClient(self: *Server) void {
         const io = self.io_threaded.io();
-        if (!self.running.load(.acquire)) return;
+        if (!self.running.swap(false, .acq_rel)) return;
         self.storage_mutex.lockUncancelable(io);
         defer self.storage_mutex.unlock(io);
-        self.storage.flush() catch |err| std.debug.print("mysqlzig dump flush failed: {s}\n", .{@errorName(err)});
-        if (!self.running.swap(false, .acq_rel)) return;
-        if (self.listener) |*listener| listener.deinit(io);
+        if (self.listener) |*listener| {
+            listener.deinit(io);
+            self.listener = null;
+        }
     }
 
-    fn handleClient(self: *Server, stream: std.Io.net.Stream) void {
-        self.handleClientFallible(stream) catch |err| logConnectionError("client", err);
+    fn handleClient(self: *Server, client: *ClientState) void {
+        defer client.done.store(true, .release);
+        self.handleClientFallible(client) catch |err| logConnectionError("client", err);
     }
 
-    fn handleClientFallible(self: *Server, stream: std.Io.net.Stream) !void {
+    fn reapClients(self: *Server) void {
+        var i: usize = 0;
+        while (i < self.clients.items.len) {
+            const client = self.clients.items[i];
+            if (!client.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            if (client.thread) |thread| thread.join();
+            client.closeStream();
+            self.allocator.destroy(client);
+            _ = self.clients.swapRemove(i);
+        }
+    }
+
+    fn handleClientFallible(self: *Server, client: *ClientState) !void {
         const io = self.io_threaded.io();
-        defer stream.close(io);
-        var conn = protocol.Connection.init(self.allocator, io, stream, self.config.username, self.config.password);
+        defer client.closeStream();
+        var conn = protocol.Connection.init(self.allocator, io, client.stream, self.config.username, self.config.password);
         defer conn.deinit();
         var prepared = std.AutoHashMap(u32, PreparedStatement).init(self.allocator);
         defer {
@@ -125,10 +200,9 @@ pub const Server = struct {
         }
         var next_statement_id: u32 = 1;
         var tx_storage: ?Storage = null;
-        var tx_lock_held = false;
+        var tx_base_version: u64 = 0;
         defer {
             if (tx_storage) |*tx| tx.deinit();
-            if (tx_lock_held) self.storage_mutex.unlock(io);
         }
 
         try conn.handshake();
@@ -160,23 +234,30 @@ pub const Server = struct {
                             continue;
                         }
                         self.storage_mutex.lockUncancelable(io);
-                        tx_lock_held = true;
-                        tx_storage = self.storage.clone() catch |err| {
-                            tx_lock_held = false;
+                        const cloned = self.storage.clone() catch |err| {
                             self.storage_mutex.unlock(io);
                             logRequestError("begin", err);
                             try conn.writeErr(1064, @errorName(err));
                             continue;
                         };
+                        tx_base_version = self.storage_version;
+                        self.storage_mutex.unlock(io);
+                        tx_storage = cloned;
                         try conn.writeOk();
                         continue;
                     }
                     if (isCommit(trimmed)) {
                         if (tx_storage) |*tx| {
+                            self.storage_mutex.lockUncancelable(io);
+                            if (self.storage_version != tx_base_version) {
+                                self.storage_mutex.unlock(io);
+                                try conn.writeErr(1213, "TransactionConflict");
+                                continue;
+                            }
                             self.storage.deinit();
                             self.storage = tx.*;
                             tx_storage = null;
-                            tx_lock_held = false;
+                            self.storage_version +%= 1;
                             self.storage_mutex.unlock(io);
                         }
                         try conn.writeOk();
@@ -186,8 +267,6 @@ pub const Server = struct {
                         if (tx_storage) |*tx| {
                             tx.deinit();
                             tx_storage = null;
-                            tx_lock_held = false;
-                            self.storage_mutex.unlock(io);
                         }
                         try conn.writeOk();
                         continue;
@@ -203,7 +282,10 @@ pub const Server = struct {
                         try conn.writeErr(mysqlErrorCode(err), @errorName(err));
                         continue;
                     };
-                    if (tx_storage == null) self.storage_mutex.unlock(io);
+                    if (tx_storage == null) {
+                        if (result.mutated) self.storage_version +%= 1;
+                        self.storage_mutex.unlock(io);
+                    }
                     defer result.deinit(self.allocator);
                     try conn.writeResult(result);
                 },
@@ -242,7 +324,10 @@ pub const Server = struct {
                         try conn.writeErr(mysqlErrorCode(err), @errorName(err));
                         continue;
                     };
-                    if (tx_storage == null) self.storage_mutex.unlock(io);
+                    if (tx_storage == null) {
+                        if (result.mutated) self.storage_version +%= 1;
+                        self.storage_mutex.unlock(io);
+                    }
                     defer result.deinit(self.allocator);
                     try conn.writeBinaryResult(result);
                 },
@@ -291,6 +376,7 @@ fn isExpectedDisconnect(err: anyerror) bool {
         std.mem.eql(u8, name, "ConnectionResetByPeer") or
         std.mem.eql(u8, name, "ConnectionAborted") or
         std.mem.eql(u8, name, "BrokenPipe") or
+        std.mem.eql(u8, name, "Canceled") or
         std.mem.eql(u8, name, "SocketUnconnected") or
         std.mem.eql(u8, name, "NotOpenForReading") or
         std.mem.eql(u8, name, "NotOpenForWriting");

@@ -7,7 +7,6 @@ pub const Storage = @import("storage.zig").Storage;
 pub const MysqlZigConfig = extern struct {
     bind_host: [*:0]const u8,
     port: u16,
-    memory_size: usize,
     dump_path: [*:0]const u8,
     username: [*:0]const u8,
     password: [*:0]const u8,
@@ -27,7 +26,6 @@ pub export fn mysqlzig_default_config() MysqlZigConfig {
     return .{
         .bind_host = "127.0.0.1",
         .port = 3306,
-        .memory_size = 256 * 1024 * 1024,
         .dump_path = "mysqlzig.dump",
         .username = "root",
         .password = "",
@@ -39,7 +37,6 @@ pub export fn mysqlzig_start(raw_cfg: *const MysqlZigConfig) ?*MysqlZigHandle {
     const cfg = Config{
         .bind_host = std.mem.span(raw_cfg.bind_host),
         .port = raw_cfg.port,
-        .memory_size = raw_cfg.memory_size,
         .dump_path = std.mem.span(raw_cfg.dump_path),
         .username = std.mem.span(raw_cfg.username),
         .password = std.mem.span(raw_cfg.password),

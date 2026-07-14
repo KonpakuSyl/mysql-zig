@@ -50,10 +50,6 @@ fn parseArgs(args: *std.process.Args.Iterator, cfg: *mysqlzig.Config) !bool {
             cfg.bind_host = args.next() orelse return error.MissingHost;
         } else if (std.mem.startsWith(u8, arg, "--host=")) {
             cfg.bind_host = arg["--host=".len..];
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--memory")) {
-            cfg.memory_size = try parseSize(args.next() orelse return error.MissingMemorySize);
-        } else if (std.mem.startsWith(u8, arg, "--memory=")) {
-            cfg.memory_size = try parseSize(arg["--memory=".len..]);
         } else if (std.mem.eql(u8, arg, "--user")) {
             cfg.username = args.next() orelse return error.MissingUser;
         } else if (std.mem.startsWith(u8, arg, "--user=")) {
@@ -89,7 +85,6 @@ fn printHelp() void {
         \\  -p, --port <port>       Listen port. Default: 3306.
         \\  -d, --dump <path>       Dump file path. Default: mysqlzig.dump.
         \\      --host <addr>       Bind host. Default: 127.0.0.1.
-        \\  -m, --memory <size>     mmap size, e.g. 256m, 1g, 1048576.
         \\      --user <name>       Username. Default: root.
         \\      --password <pass>   Password. Default: empty.
         \\
@@ -101,20 +96,6 @@ fn printHelp() void {
 
 fn parsePort(text: []const u8) !u16 {
     return std.fmt.parseInt(u16, text, 10);
-}
-
-fn parseSize(text: []const u8) !usize {
-    if (text.len == 0) return error.BadMemorySize;
-    const suffix = std.ascii.toLower(text[text.len - 1]);
-    const has_suffix = suffix == 'k' or suffix == 'm' or suffix == 'g';
-    const number_text = if (has_suffix) text[0 .. text.len - 1] else text;
-    const base = try std.fmt.parseInt(usize, number_text, 10);
-    return switch (suffix) {
-        'k' => base * 1024,
-        'm' => base * 1024 * 1024,
-        'g' => base * 1024 * 1024 * 1024,
-        else => base,
-    };
 }
 
 fn installSignalHandlers() void {

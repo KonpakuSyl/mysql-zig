@@ -15,6 +15,7 @@ pub const Result = struct {
     columns: []Column = &.{},
     rows: []Row = &.{},
     affected_rows: u64 = 0,
+    mutated: bool = false,
 
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
         for (self.rows) |row| {
@@ -196,15 +197,7 @@ pub fn execute(allocator: std.mem.Allocator, db: *storage.Storage, query: []cons
     return switch (stmt) {
         .ok => ok(),
         .select => |s| selectQuery(allocator, db, s),
-        .insert => |s| insertInto(db, s),
-        .update => |s| updateRows(allocator, db, s),
-        .delete => |s| deleteFrom(allocator, db, s),
-        .create_table => |s| createTable(db, s.name, s.columns, s.indexes, s.checks, s.if_not_exists),
-        .create_index => |s| createIndex(db, s),
-        .drop_index => |s| dropIndex(db, s),
-        .alter_table => |s| alterTable(db, s.table, s.action),
-        .drop_table => |s| dropTable(db, s.name, s.if_exists),
-        .truncate_table => |name| truncateTable(db, name),
+        .insert, .update, .delete, .create_table, .create_index, .drop_index, .alter_table, .drop_table, .truncate_table => executeMutation(allocator, db, stmt),
         .describe => |name| describeTable(allocator, db, name, null),
         .show_create_table => |name| showCreateTable(allocator, db, name),
         .show_tables => |s| showTables(allocator, db, s.pattern, s.full),
@@ -214,6 +207,28 @@ pub fn execute(allocator: std.mem.Allocator, db: *storage.Storage, query: []cons
         .show_variables => |pattern| showVariables(allocator, pattern),
         .show_create_database => |name| showCreateDatabase(allocator, name),
     };
+}
+
+fn executeMutation(allocator: std.mem.Allocator, db: *storage.Storage, stmt: Statement) !Result {
+    var next = try db.clone();
+    errdefer next.deinit();
+
+    var result = switch (stmt) {
+        .insert => |s| try insertInto(&next, s),
+        .update => |s| try updateRows(allocator, &next, s),
+        .delete => |s| try deleteFrom(allocator, &next, s),
+        .create_table => |s| try createTable(&next, s.name, s.columns, s.indexes, s.checks, s.if_not_exists),
+        .create_index => |s| try createIndex(&next, s),
+        .drop_index => |s| try dropIndex(&next, s),
+        .alter_table => |s| try alterTable(&next, s.table, s.action),
+        .drop_table => |s| try dropTable(&next, s.name, s.if_exists),
+        .truncate_table => |name| try truncateTable(&next, name),
+        else => unreachable,
+    };
+    db.deinit();
+    db.* = next;
+    result.mutated = true;
+    return result;
 }
 
 fn ok() Result {
@@ -431,6 +446,7 @@ fn dropPrimaryKey(table: *storage.Table, db: *storage.Storage) !void {
 }
 
 fn validateConvertedUnique(allocator: std.mem.Allocator, table: *const storage.Table, column_index: usize, values: []const storage.Value) !void {
+    _ = allocator;
     var needs_check = false;
     var primary = false;
     for (table.indexes.items) |index| {
@@ -440,13 +456,15 @@ fn validateConvertedUnique(allocator: std.mem.Allocator, table: *const storage.T
         }
     }
     if (!needs_check) return;
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
     for (table.rows.items, 0..) |row, i| {
         if (row.deleted) continue;
-        if (primary and values[i] == .null) return error.NotNullViolation;
-        const result = try seen.getOrPut(storage.valueHash(values[i]));
-        if (result.found_existing) return error.UniqueConstraintViolation;
+        if (values[i] == .null) {
+            if (primary) return error.NotNullViolation;
+            continue;
+        }
+        for (table.rows.items[0..i], 0..) |previous, j| {
+            if (!previous.deleted and values[j] != .null and compareValues(values[i], values[j]) == 0) return error.UniqueConstraintViolation;
+        }
     }
 }
 
@@ -733,7 +751,7 @@ fn candidateRowsForWhere(allocator: std.mem.Allocator, db: *storage.Storage, tab
     if (where_expr) |expr| {
         if (simpleIndexedPredicate(table, expr)) |pred| {
             const key = try coerceColumn(allocator, table.columns[pred.column_index], pred.value);
-            if (db.indexedLookup(table, pred.column_index, key)) |hits| return allocator.dupe(storage.RowId, hits);
+            if (try db.indexedLookup(allocator, table, pred.column_index, key)) |hits| return hits;
         }
     }
     return candidateRows(allocator, db, table, conditions);
@@ -1365,7 +1383,7 @@ fn candidateRows(allocator: std.mem.Allocator, db: *storage.Storage, table: *sto
         if (cond == .compare and cond.compare.op == .eq) {
             const idx = storage.Storage.columnIndex(table, cond.compare.column) orelse return error.UnknownColumn;
             const key = try coerceColumn(allocator, table.columns[idx], cond.compare.value);
-            if (db.indexedLookup(table, idx, key)) |hits| return allocator.dupe(storage.RowId, hits);
+            if (try db.indexedLookup(allocator, table, idx, key)) |hits| return hits;
         }
     }
     var rows = std.array_list.Managed(storage.RowId).init(allocator);
@@ -3380,7 +3398,7 @@ test "sql extended types and syntax" {
     const io = threaded.io();
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
+    var db = try storage.Storage.init(allocator, io, path);
     defer db.deinit();
 
     var r = try execute(allocator, &db, "SELECT VERSION()");
@@ -3444,7 +3462,7 @@ test "sql small app completeness features" {
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     {
-        var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
+        var db = try storage.Storage.init(allocator, io, path);
         defer db.deinit();
 
         var r = try execute(allocator, &db, "create table users (id int auto_increment, email varchar(32) not null, age smallint not null default 18, role enum('admin','user'), flags set('a','b'), profile json, born date, at time, yy year, cc char(3), raw varbinary(4), primary key(id), unique key uq_email(email))");
@@ -3524,7 +3542,7 @@ test "sql small app completeness features" {
     }
 
     {
-        var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
+        var db = try storage.Storage.init(allocator, io, path);
         defer db.deinit();
         var r = try execute(allocator, &db, "select count(*) from users");
         try std.testing.expectEqualStrings("2", r.rows[0].values[0].?);
@@ -3545,7 +3563,7 @@ test "sql ddl constraints and unsigned extended types" {
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     {
-        var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
+        var db = try storage.Storage.init(allocator, io, path);
         defer db.deinit();
 
         var r = try execute(allocator, &db, "create table ext (id int unsigned auto_increment, m mediumint unsigned not null, bits bit(3), bin binary(4), tt tinytext, tb tinyblob, mt mediumtext, mb mediumblob, lt longtext, lb longblob, primary key(id), check (m <= 16777215 and bits < 8))");
@@ -3592,7 +3610,7 @@ test "sql ddl constraints and unsigned extended types" {
     }
 
     {
-        var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
+        var db = try storage.Storage.init(allocator, io, path);
         defer db.deinit();
         var r = try execute(allocator, &db, "select count(*) from ext");
         try std.testing.expectEqualStrings("2", r.rows[0].values[0].?);
@@ -3612,7 +3630,7 @@ test "select supports multiple order by expressions" {
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
+    var db = try storage.Storage.init(allocator, io, path);
     defer db.deinit();
     var r = try execute(allocator, &db, "create table game_versions (version varchar(16), white_device_only bool, small_update_type int, created_at int)");
     r.deinit(allocator);
@@ -3637,7 +3655,7 @@ test "select uses a single-column index outside the first table column" {
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    var db = try storage.Storage.init(allocator, io, 1024 * 1024, path);
+    var db = try storage.Storage.init(allocator, io, path);
     defer db.deinit();
 
     var r = try execute(allocator, &db, "create table white_devices (id int primary key, name varchar(32), device_id varchar(64), is_delete bool, unique index did (device_id))");
@@ -3650,4 +3668,40 @@ test "select uses a single-column index outside the first table column" {
     try std.testing.expectEqual(@as(usize, 1), r.rows.len);
     try std.testing.expectEqualStrings("1", r.rows[0].values[0].?);
     try std.testing.expectEqualStrings("allowed", r.rows[0].values[1].?);
+}
+
+test "failed multi-row insert and update are statement atomic" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-statement-atomic-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table atomic_rows (id int primary key, code int, unique key uq_code(code))");
+    try std.testing.expect(r.mutated);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "insert into atomic_rows values (1, 10)");
+    r.deinit(allocator);
+    try std.testing.expectError(error.UniqueConstraintViolation, execute(allocator, &db, "insert into atomic_rows values (2, 20), (3, 10)"));
+
+    r = try execute(allocator, &db, "select id, code from atomic_rows order by id");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("10", r.rows[0].values[1].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "insert into atomic_rows values (2, 20)");
+    r.deinit(allocator);
+    try std.testing.expectError(error.UniqueConstraintViolation, execute(allocator, &db, "update atomic_rows set code = 30"));
+
+    r = try execute(allocator, &db, "select id, code from atomic_rows order by id");
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.len);
+    try std.testing.expectEqualStrings("10", r.rows[0].values[1].?);
+    try std.testing.expectEqualStrings("20", r.rows[1].values[1].?);
 }
