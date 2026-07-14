@@ -3242,6 +3242,7 @@ const Parser = struct {
         if (!self.matchKeyword("limit")) return null;
         const first = try self.expectNumber();
         if (self.match(.comma)) return .{ .offset = first, .count = try self.expectNumber() };
+        if (self.matchKeyword("offset")) return .{ .offset = try self.expectNumber(), .count = first };
         return .{ .count = first };
     }
 
@@ -3350,7 +3351,7 @@ fn isIdentContinue(c: u8) bool {
 }
 
 fn isReserved(text: []const u8) bool {
-    const words = [_][]const u8{ "from", "where", "order", "limit", "as", "and", "or", "not", "desc", "asc", "inner", "left", "outer", "join", "on", "group", "having" };
+    const words = [_][]const u8{ "from", "where", "order", "limit", "offset", "as", "and", "or", "not", "desc", "asc", "inner", "left", "outer", "join", "on", "group", "having" };
     for (words) |word| if (std.ascii.eqlIgnoreCase(text, word)) return true;
     return false;
 }
@@ -3618,9 +3619,13 @@ test "select supports multiple order by expressions" {
     r = try execute(allocator, &db, "insert into game_versions values ('2.0', false, 1, 10), ('1.0', false, 1, 10), ('3.0', false, 4, 20)");
     r.deinit(allocator);
     r = try execute(allocator, &db, "SELECT * FROM `game_versions` WHERE (white_device_only = false and small_update_type != 4) ORDER BY created_at DESC,`game_versions`.`version` ASC LIMIT 1");
-    defer r.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), r.rows.len);
     try std.testing.expectEqualStrings("1.0", r.rows[0].values[0].?);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "SELECT * FROM `game_versions` WHERE (white_device_only = false and small_update_type != 4) ORDER BY created_at DESC,`game_versions`.`version` ASC LIMIT 1 OFFSET 1");
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("2.0", r.rows[0].values[0].?);
 }
 
 test "select uses a single-column index outside the first table column" {
