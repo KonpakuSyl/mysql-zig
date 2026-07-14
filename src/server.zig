@@ -85,8 +85,12 @@ pub const Server = struct {
     fn acceptLoop(self: *Server) void {
         const io = self.io_threaded.io();
         while (self.running.load(.acquire)) {
-            var stream = (self.listener orelse return).accept(io) catch break;
-            const thread = std.Thread.spawn(.{}, handleClient, .{ self, stream }) catch {
+            var stream = (self.listener orelse return).accept(io) catch |err| {
+                if (self.running.load(.acquire)) logConnectionError("accept", err);
+                break;
+            };
+            const thread = std.Thread.spawn(.{}, handleClient, .{ self, stream }) catch |err| {
+                logConnectionError("spawn", err);
                 stream.close(io);
                 continue;
             };
@@ -105,6 +109,10 @@ pub const Server = struct {
     }
 
     fn handleClient(self: *Server, stream: std.Io.net.Stream) void {
+        self.handleClientFallible(stream) catch |err| logConnectionError("client", err);
+    }
+
+    fn handleClientFallible(self: *Server, stream: std.Io.net.Stream) !void {
         const io = self.io_threaded.io();
         defer stream.close(io);
         var conn = protocol.Connection.init(self.allocator, io, stream, self.config.username, self.config.password);
@@ -123,32 +131,32 @@ pub const Server = struct {
             if (tx_lock_held) self.storage_mutex.unlock(io);
         }
 
-        conn.handshake() catch return;
+        try conn.handshake();
         while (self.running.load(.acquire)) {
-            const packet = conn.readPacket() catch return;
+            const packet = try conn.readPacket();
             defer self.allocator.free(packet.payload);
             if (packet.payload.len == 0) return;
             switch (packet.payload[0]) {
                 protocol.command_quit => return,
-                protocol.command_ping => conn.writeOk() catch return,
+                protocol.command_ping => try conn.writeOk(),
                 protocol.command_shutdown => {
-                    conn.writeOk() catch return;
+                    try conn.writeOk();
                     self.requestShutdownFromClient();
                     return;
                 },
-                protocol.command_init_db => conn.writeOk() catch return,
-                protocol.command_field_list => conn.writeFieldListEof() catch return,
+                protocol.command_init_db => try conn.writeOk(),
+                protocol.command_field_list => try conn.writeFieldListEof(),
                 protocol.command_query => {
                     const query = packet.payload[1..];
                     const trimmed = std.mem.trim(u8, query, " \t\r\n;");
                     if (std.ascii.eqlIgnoreCase(trimmed, "shutdown")) {
-                        conn.writeOk() catch return;
+                        try conn.writeOk();
                         self.requestShutdownFromClient();
                         return;
                     }
                     if (isBegin(trimmed)) {
                         if (tx_storage != null) {
-                            conn.writeErr(1064, "TransactionAlreadyStarted") catch {};
+                            try conn.writeErr(1064, "TransactionAlreadyStarted");
                             continue;
                         }
                         self.storage_mutex.lockUncancelable(io);
@@ -156,10 +164,11 @@ pub const Server = struct {
                         tx_storage = self.storage.clone() catch |err| {
                             tx_lock_held = false;
                             self.storage_mutex.unlock(io);
-                            conn.writeErr(1064, @errorName(err)) catch {};
+                            logRequestError("begin", err);
+                            try conn.writeErr(1064, @errorName(err));
                             continue;
                         };
-                        conn.writeOk() catch return;
+                        try conn.writeOk();
                         continue;
                     }
                     if (isCommit(trimmed)) {
@@ -170,7 +179,7 @@ pub const Server = struct {
                             tx_lock_held = false;
                             self.storage_mutex.unlock(io);
                         }
-                        conn.writeOk() catch return;
+                        try conn.writeOk();
                         continue;
                     }
                     if (isRollback(trimmed)) {
@@ -180,7 +189,7 @@ pub const Server = struct {
                             tx_lock_held = false;
                             self.storage_mutex.unlock(io);
                         }
-                        conn.writeOk() catch return;
+                        try conn.writeOk();
                         continue;
                     }
 
@@ -190,31 +199,35 @@ pub const Server = struct {
                     };
                     const result = sql.execute(self.allocator, target_storage, query) catch |err| {
                         if (tx_storage == null) self.storage_mutex.unlock(io);
-                        conn.writeErr(mysqlErrorCode(err), @errorName(err)) catch {};
+                        logRequestError("query", err);
+                        try conn.writeErr(mysqlErrorCode(err), @errorName(err));
                         continue;
                     };
                     if (tx_storage == null) self.storage_mutex.unlock(io);
                     defer result.deinit(self.allocator);
-                    conn.writeResult(result) catch return;
+                    try conn.writeResult(result);
                 },
                 protocol.command_stmt_prepare => {
                     const query = packet.payload[1..];
                     const statement_id = next_statement_id;
                     next_statement_id +%= 1;
                     var stmt = PreparedStatement.init(self.allocator, query) catch |err| {
-                        conn.writeErr(1064, @errorName(err)) catch {};
+                        logRequestError("prepare", err);
+                        try conn.writeErr(1064, @errorName(err));
                         continue;
                     };
                     prepared.put(statement_id, stmt) catch |err| {
                         stmt.deinit(self.allocator);
-                        conn.writeErr(1064, @errorName(err)) catch {};
+                        logRequestError("prepare", err);
+                        try conn.writeErr(1064, @errorName(err));
                         continue;
                     };
-                    conn.writePrepareOk(statement_id, stmt.param_count) catch return;
+                    try conn.writePrepareOk(statement_id, stmt.param_count);
                 },
                 protocol.command_stmt_execute => {
                     const exec = parseStmtExecute(self.allocator, packet.payload, &prepared) catch |err| {
-                        conn.writeErr(1064, @errorName(err)) catch {};
+                        logRequestError("execute", err);
+                        try conn.writeErr(1064, @errorName(err));
                         continue;
                     };
                     defer self.allocator.free(exec);
@@ -225,12 +238,13 @@ pub const Server = struct {
                     };
                     const result = sql.execute(self.allocator, target_storage, exec) catch |err| {
                         if (tx_storage == null) self.storage_mutex.unlock(io);
-                        conn.writeErr(mysqlErrorCode(err), @errorName(err)) catch {};
+                        logRequestError("execute", err);
+                        try conn.writeErr(mysqlErrorCode(err), @errorName(err));
                         continue;
                     };
                     if (tx_storage == null) self.storage_mutex.unlock(io);
                     defer result.deinit(self.allocator);
-                    conn.writeBinaryResult(result) catch return;
+                    try conn.writeBinaryResult(result);
                 },
                 protocol.command_stmt_close => {
                     if (packet.payload.len >= 5) {
@@ -243,17 +257,44 @@ pub const Server = struct {
                 },
                 protocol.command_stmt_reset => {
                     resetPreparedStatement(&prepared, packet.payload) catch |err| {
-                        conn.writeErr(1064, @errorName(err)) catch {};
+                        logRequestError("reset", err);
+                        try conn.writeErr(1064, @errorName(err));
                         continue;
                     };
-                    conn.writeOk() catch return;
+                    try conn.writeOk();
                 },
-                protocol.command_stmt_send_long_data => appendStmtLongData(self.allocator, &prepared, packet.payload) catch return,
-                else => conn.writeErr(1047, "unsupported command") catch return,
+                protocol.command_stmt_send_long_data => {
+                    appendStmtLongData(self.allocator, &prepared, packet.payload) catch |err| {
+                        logRequestError("long-data", err);
+                        try conn.writeErr(1064, @errorName(err));
+                        continue;
+                    };
+                },
+                else => try conn.writeErr(1047, "unsupported command"),
             }
         }
     }
 };
+
+fn logConnectionError(stage: []const u8, err: anyerror) void {
+    if (isExpectedDisconnect(err)) return;
+    std.log.warn("mysqlzig connection stage={s} error={s}", .{ stage, @errorName(err) });
+}
+
+fn logRequestError(operation: []const u8, err: anyerror) void {
+    std.log.warn("mysqlzig request operation={s} error={s}", .{ operation, @errorName(err) });
+}
+
+fn isExpectedDisconnect(err: anyerror) bool {
+    const name = @errorName(err);
+    return std.mem.eql(u8, name, "EndOfStream") or
+        std.mem.eql(u8, name, "ConnectionResetByPeer") or
+        std.mem.eql(u8, name, "ConnectionAborted") or
+        std.mem.eql(u8, name, "BrokenPipe") or
+        std.mem.eql(u8, name, "SocketUnconnected") or
+        std.mem.eql(u8, name, "NotOpenForReading") or
+        std.mem.eql(u8, name, "NotOpenForWriting");
+}
 
 const PreparedStatement = struct {
     query: []u8,
@@ -532,7 +573,7 @@ test "prepared statement long data is accumulated and cleared" {
     try appendStmtLongData(allocator, &prepared, &second_chunk);
 
     const execute_with_types = [_]u8{
-        0x17, 1, 0, 0, 0, 0, 1, 0, 0, 0,
+        0x17, 1, 0,    0, 0,    0, 1, 0, 0, 0,
         0,    1, 0xfd, 0, 0x03, 0, 7, 0, 0, 0,
     };
     const sql_with_long_data = try parseStmtExecute(allocator, &execute_with_types, &prepared);
@@ -541,8 +582,8 @@ test "prepared statement long data is accumulated and cleared" {
     try std.testing.expect(prepared.getPtr(1).?.long_data[0] == null);
 
     const execute_reusing_types = [_]u8{
-        0x17, 1, 0, 0, 0, 0, 1, 0, 0, 0,
-        0,    0, 1,    'x', 8,    0, 0, 0,
+        0x17, 1, 0, 0,   0, 0, 1, 0, 0, 0,
+        0,    0, 1, 'x', 8, 0, 0, 0,
     };
     const sql_reusing_types = try parseStmtExecute(allocator, &execute_reusing_types, &prepared);
     defer allocator.free(sql_reusing_types);
