@@ -184,7 +184,8 @@ const Statement = union(enum) {
 pub fn execute(allocator: std.mem.Allocator, db: *storage.Storage, query: []const u8) !Result {
     const trimmed = trimSemi(std.mem.trim(u8, query, " \t\r\n"));
     if (trimmed.len == 0) return ok();
-    if (startsWith(trimmed, "select @@version")) return singleColumnRows(allocator, "@@version", &.{"8.0.46-mysqlzig"});
+    if (std.ascii.eqlIgnoreCase(trimmed, "select @@version")) return singleColumnRows(allocator, "@@version", &.{"8.0.46-mysqlzig"});
+    if (std.ascii.eqlIgnoreCase(trimmed, "select @@version_comment")) return singleColumnRows(allocator, "@@version_comment", &.{"mysqlzig"});
     if (startsWith(trimmed, "select database()")) return singleColumnRows(allocator, "DATABASE()", &.{"main"});
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -325,26 +326,26 @@ fn truncateTable(db: *storage.Storage, name: []const u8) !Result {
 fn defaultForColumn(allocator: std.mem.Allocator, table: *const storage.Table, col: storage.Column) !storage.Value {
     if (col.auto_increment) return .{ .int = @intCast(table.next_row_id) };
     if (col.default_value) |default_value| {
-        if (defaultValueFunction(col.kind, default_value)) |computed| return computed;
+        if (try defaultValueFunction(allocator, col.kind, default_value)) |computed| return computed;
         return try coerceColumn(allocator, col, default_value);
     }
     if (!col.nullable or col.primary) return error.NotNullViolation;
     return .null;
 }
 
-fn defaultValueFunction(kind: storage.Column.Kind, value: storage.Value) ?storage.Value {
+fn defaultValueFunction(allocator: std.mem.Allocator, kind: storage.Column.Kind, value: storage.Value) !?storage.Value {
     const text = valueText(value) orelse return null;
     if (std.ascii.eqlIgnoreCase(text, "current_timestamp") or std.ascii.eqlIgnoreCase(text, "now")) {
         return switch (kind) {
-            .datetime => .{ .datetime = "2026-07-07 00:00:00" },
-            .date => .{ .date = "2026-07-07" },
+            .datetime => .{ .datetime = try currentDateTime(allocator) },
+            .date => .{ .date = try currentDate(allocator) },
             else => null,
         };
     }
     if (std.ascii.eqlIgnoreCase(text, "current_date")) {
         return switch (kind) {
-            .date => .{ .date = "2026-07-07" },
-            .datetime => .{ .datetime = "2026-07-07 00:00:00" },
+            .date => .{ .date = try currentDate(allocator) },
+            .datetime => .{ .datetime = try currentDateTime(allocator) },
             else => null,
         };
     }
@@ -425,12 +426,17 @@ fn modifyColumn(db: *storage.Storage, table: *storage.Table, old_name: []const u
         if (!row.deleted and (!stored_col.nullable or stored_col.primary) and converted[i] == .null) return error.NotNullViolation;
     }
     const old_col = table.columns[idx];
-    table.columns[idx] = stored_col;
-    validateAllRows(db.allocator, table) catch |err| {
-        table.columns[idx] = old_col;
-        return err;
-    };
-    table.columns[idx] = old_col;
+    var validation_values = try scratch.alloc(storage.Value, table.columns.len);
+    {
+        table.columns[idx] = stored_col;
+        defer table.columns[idx] = old_col;
+        for (table.rows.items, 0..) |row, i| {
+            if (row.deleted) continue;
+            @memcpy(validation_values, row.values);
+            validation_values[idx] = converted[i];
+            try validateChecksForValues(scratch, table, validation_values);
+        }
+    }
     try validateConvertedUnique(scratch, table, idx, converted);
     try db.replaceColumn(table, idx, stored_col, converted);
 }
@@ -1015,13 +1021,38 @@ fn emptyContext(allocator: std.mem.Allocator, table: *const storage.Table, alias
 
 fn groupKey(allocator: std.mem.Allocator, ctx: RowContext, exprs: []const *const Expr) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
-    for (exprs) |expr| {
-        const value = try evalExpr(allocator, ctx, expr, null);
-        const bytes = try valueBytes(allocator, value);
-        if (bytes) |b| try out.appendSlice(b) else try out.appendSlice("<NULL>");
-        try out.append(0);
-    }
+    for (exprs) |expr| try appendGroupValue(&out, try evalExpr(allocator, ctx, expr, null));
     return out.toOwnedSlice();
+}
+
+fn appendGroupValue(out: *std.array_list.Managed(u8), value: storage.Value) !void {
+    switch (value) {
+        .null => try out.append(0),
+        .int => |v| try appendGroupFixed(out, 1, v),
+        .bool => |v| try appendGroupFixed(out, 2, v),
+        .real => |v| try appendGroupFixed(out, 3, v),
+        .text => |v| try appendGroupSlice(out, 4, v),
+        .decimal => |v| try appendGroupSlice(out, 5, v),
+        .blob => |v| try appendGroupSlice(out, 6, v),
+        .date => |v| try appendGroupSlice(out, 7, v),
+        .datetime => |v| try appendGroupSlice(out, 8, v),
+        .time => |v| try appendGroupSlice(out, 9, v),
+        .year => |v| try appendGroupFixed(out, 10, v),
+        .json => |v| try appendGroupSlice(out, 11, v),
+    }
+}
+
+fn appendGroupFixed(out: *std.array_list.Managed(u8), tag: u8, value: anytype) !void {
+    var copy = value;
+    try out.append(tag);
+    try out.appendSlice(std.mem.asBytes(&copy));
+}
+
+fn appendGroupSlice(out: *std.array_list.Managed(u8), tag: u8, value: []const u8) !void {
+    try out.append(tag);
+    var len: u64 = @intCast(value.len);
+    try out.appendSlice(std.mem.asBytes(&len));
+    try out.appendSlice(value);
 }
 
 fn appendStarValues(allocator: std.mem.Allocator, ctx: RowContext, values: []?[]const u8, start: usize) !usize {
@@ -1081,11 +1112,12 @@ fn evalExpr(allocator: std.mem.Allocator, ctx: RowContext, expr: *const Expr, gr
             if (left == .null or right == .null) break :blk .null;
             const l = try asReal(left);
             const r = try asReal(right);
+            if (b.op == .div and r == 0) break :blk .null;
             break :blk .{ .real = switch (b.op) {
                 .add => l + r,
                 .sub => l - r,
                 .mul => l * r,
-                .div => if (r == 0) 0 else l / r,
+                .div => l / r,
                 else => unreachable,
             } };
         },
@@ -1170,8 +1202,8 @@ fn evalCall(allocator: std.mem.Allocator, ctx: RowContext, name: []const u8, arg
         if (args.len != 0) return error.BadFunctionArity;
         return .{ .text = "8.0.46-mysqlzig" };
     }
-    if (std.ascii.eqlIgnoreCase(name, "now")) return .{ .datetime = "2026-07-07 00:00:00" };
-    if (std.ascii.eqlIgnoreCase(name, "current_date")) return .{ .date = "2026-07-07" };
+    if (std.ascii.eqlIgnoreCase(name, "now") or std.ascii.eqlIgnoreCase(name, "current_timestamp")) return .{ .datetime = try currentDateTime(allocator) };
+    if (std.ascii.eqlIgnoreCase(name, "current_date")) return .{ .date = try currentDate(allocator) };
     if (std.ascii.eqlIgnoreCase(name, "lower") or std.ascii.eqlIgnoreCase(name, "upper")) {
         if (args.len != 1) return error.BadFunctionArity;
         const text = valueText(try evalExpr(allocator, ctx, args[0], group)) orelse return .null;
@@ -1181,11 +1213,15 @@ fn evalCall(allocator: std.mem.Allocator, ctx: RowContext, name: []const u8, arg
     }
     if (std.ascii.eqlIgnoreCase(name, "length")) {
         if (args.len != 1) return error.BadFunctionArity;
-        return .{ .int = @intCast((valueText(try evalExpr(allocator, ctx, args[0], group)) orelse @as([]const u8, "")).len) };
+        const bytes = try valueBytes(allocator, try evalExpr(allocator, ctx, args[0], group)) orelse return .null;
+        return .{ .int = @intCast(bytes.len) };
     }
     if (std.ascii.eqlIgnoreCase(name, "concat")) {
         var out = std.array_list.Managed(u8).init(allocator);
-        for (args) |arg| if (valueText(try evalExpr(allocator, ctx, arg, group))) |text| try out.appendSlice(text);
+        for (args) |arg| {
+            const bytes = try valueBytes(allocator, try evalExpr(allocator, ctx, arg, group)) orelse return .null;
+            try out.appendSlice(bytes);
+        }
         return .{ .text = try out.toOwnedSlice() };
     }
     if (std.ascii.eqlIgnoreCase(name, "abs")) {
@@ -1878,9 +1914,25 @@ fn compareValues(left: storage.Value, right: storage.Value) i8 {
     if (left == .null and right == .null) return 0;
     if (left == .null) return -1;
     if (right == .null) return 1;
+    if (bothTextual(left, right)) return compareTextValues(left, right);
     if (numericValue(left)) |l| {
         if (numericValue(right)) |r| return if (l < r) -1 else if (l > r) 1 else 0;
     }
+    return compareTextValues(left, right);
+}
+
+fn bothTextual(left: storage.Value, right: storage.Value) bool {
+    return isTextual(left) and isTextual(right);
+}
+
+fn isTextual(value: storage.Value) bool {
+    return switch (value) {
+        .text, .blob, .date, .datetime, .time, .json => true,
+        else => false,
+    };
+}
+
+fn compareTextValues(left: storage.Value, right: storage.Value) i8 {
     const l = valueText(left) orelse "";
     const r = valueText(right) orelse "";
     return switch (std.mem.order(u8, l, r)) {
@@ -1888,6 +1940,29 @@ fn compareValues(left: storage.Value, right: storage.Value) i8 {
         .eq => 0,
         .gt => 1,
     };
+}
+
+fn currentDateTime(allocator: std.mem.Allocator) ![]const u8 {
+    const now = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).toMilliseconds();
+    const seconds: u64 = @intCast(@divFloor(now, 1000));
+    const epoch = std.time.epoch.EpochSeconds{ .secs = seconds };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
+}
+
+fn currentDate(allocator: std.mem.Allocator) ![]const u8 {
+    const datetime = try currentDateTime(allocator);
+    defer allocator.free(datetime);
+    return allocator.dupe(u8, datetime[0..10]);
 }
 
 fn valueBytes(allocator: std.mem.Allocator, value: storage.Value) !?[]const u8 {
@@ -1902,7 +1977,7 @@ fn valueBytes(allocator: std.mem.Allocator, value: storage.Value) !?[]const u8 {
         .date => |v| try allocator.dupe(u8, v),
         .datetime => |v| try allocator.dupe(u8, v),
         .time => |v| try allocator.dupe(u8, v),
-        .year => |v| try std.fmt.allocPrint(allocator, "{d:0>4}", .{v}),
+        .year => |v| try std.fmt.allocPrint(allocator, "{d:0>4}", .{@as(u32, @intCast(v))}),
         .json => |v| try allocator.dupe(u8, v),
     };
 }
@@ -2123,13 +2198,20 @@ fn asInt(value: storage.Value) !i64 {
     return switch (value) {
         .int => |v| v,
         .bool => |v| @intFromBool(v),
-        .real => |v| @intFromFloat(v),
+        .real => |v| floatToI64(v),
         .year => |v| v,
         else => {
             const text = valueText(value) orelse return error.BadInteger;
             return std.fmt.parseInt(i64, text, 10);
         },
     };
+}
+
+fn floatToI64(value: f64) !i64 {
+    const min: f64 = -0x1p63;
+    const max_exclusive: f64 = 0x1p63;
+    if (!std.math.isFinite(value) or value < min or value >= max_exclusive) return error.IntegerOutOfRange;
+    return @intFromFloat(value);
 }
 
 fn asBool(value: storage.Value) !bool {
@@ -2170,6 +2252,7 @@ fn numericValue(value: storage.Value) ?f64 {
         .int => |v| @floatFromInt(v),
         .bool => |v| if (v) 1 else 0,
         .real => |v| v,
+        .year => |v| @floatFromInt(v),
         else => if (valueText(value)) |text| std.fmt.parseFloat(f64, text) catch null else null,
     };
 }
@@ -2291,15 +2374,8 @@ fn tokenize(allocator: std.mem.Allocator, input: []const u8) ![]Token {
                 i += 1;
             },
             '-' => {
-                if (i + 1 < input.len and std.ascii.isDigit(input[i + 1])) {
-                    const start = i;
-                    i += 1;
-                    while (i < input.len and (std.ascii.isDigit(input[i]) or input[i] == '.')) i += 1;
-                    try tokens.append(.{ .kind = .number, .text = input[start..i] });
-                } else {
-                    try tokens.append(.{ .kind = .minus, .text = input[i .. i + 1] });
-                    i += 1;
-                }
+                try tokens.append(.{ .kind = .minus, .text = input[i .. i + 1] });
+                i += 1;
             },
             '/' => {
                 try tokens.append(.{ .kind = .slash, .text = input[i .. i + 1] });
@@ -3168,6 +3244,9 @@ const Parser = struct {
     }
 
     fn parseUnary(self: *Parser) anyerror!*const Expr {
+        if (self.peek().kind == .minus and self.index + 1 < self.tokens.len and self.tokens[self.index + 1].kind == .number) {
+            return self.newExpr(.{ .literal = try self.parseLiteral() });
+        }
         if (self.match(.minus)) return self.newExpr(.{ .unary = .{ .op = .neg, .expr = try self.parseUnary() } });
         return self.parsePrimary();
     }
@@ -3199,7 +3278,7 @@ const Parser = struct {
             try self.expectKeyword("end");
             return self.newExpr(.{ .case_expr = .{ .operand = operand, .cases = try cases.toOwnedSlice(), .else_expr = else_expr } });
         }
-        if (std.ascii.eqlIgnoreCase(tok.text, "current_date")) return self.newExpr(.{ .call = .{ .name = tok.text, .args = &.{} } });
+        if (std.ascii.eqlIgnoreCase(tok.text, "current_date") or std.ascii.eqlIgnoreCase(tok.text, "current_timestamp")) return self.newExpr(.{ .call = .{ .name = tok.text, .args = &.{} } });
         if (self.match(.lparen)) {
             if (std.ascii.eqlIgnoreCase(tok.text, "count") and self.match(.star)) {
                 try self.expect(.rparen);
@@ -3282,12 +3361,20 @@ const Parser = struct {
     }
 
     fn parseLiteral(self: *Parser) !storage.Value {
+        const negative = self.match(.minus);
         const tok = self.next();
+        if (negative and tok.kind != .number) return error.ExpectedLiteral;
         return switch (tok.kind) {
-            .number => if (std.mem.indexOfScalar(u8, tok.text, '.') != null)
-                .{ .real = try std.fmt.parseFloat(f64, tok.text) }
-            else
-                .{ .int = try std.fmt.parseInt(i64, tok.text, 10) },
+            .number => if (std.mem.indexOfScalar(u8, tok.text, '.') != null) .{
+                .real = @as(f64, if (negative) -1.0 else 1.0) * try std.fmt.parseFloat(f64, tok.text),
+            } else if (negative) blk: {
+                const magnitude = try std.fmt.parseInt(u64, tok.text, 10);
+                const min_magnitude = @as(u64, 1) << 63;
+                if (magnitude > min_magnitude) return error.Overflow;
+                break :blk .{ .int = if (magnitude == min_magnitude) std.math.minInt(i64) else -@as(i64, @intCast(magnitude)) };
+            } else .{
+                .int = try std.fmt.parseInt(i64, tok.text, 10),
+            },
             .string => .{ .text = tok.text },
             .ident => if (std.ascii.eqlIgnoreCase(tok.text, "null"))
                 .null
@@ -3704,4 +3791,156 @@ test "failed multi-row insert and update are statement atomic" {
     try std.testing.expectEqual(@as(usize, 2), r.rows.len);
     try std.testing.expectEqualStrings("10", r.rows[0].values[1].?);
     try std.testing.expectEqualStrings("20", r.rows[1].values[1].?);
+}
+
+test "subtraction and real to integer conversion are safe" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-arithmetic-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+
+    var r = try execute(allocator, &db, "select 5 - 3");
+    try std.testing.expectEqualStrings("2", r.rows[0].values[0].?);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select -9223372036854775808");
+    try std.testing.expectEqualStrings("-9223372036854775808", r.rows[0].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "create table arithmetic_rows (id int primary key, x int, y int)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into arithmetic_rows values (1, 20, 5), (2, -3, 20)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "update arithmetic_rows set x = x - 1 where id = 1");
+    try std.testing.expectEqual(@as(u64, 1), r.affected_rows);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select x from arithmetic_rows where x > y - 10 order by id");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("19", r.rows[0].values[0].?);
+    r.deinit(allocator);
+
+    try std.testing.expectError(error.IntegerOutOfRange, execute(allocator, &db, "insert into arithmetic_rows values (3, 1000000000000000000000000000000.0, 0)"));
+    try std.testing.expectError(error.IntegerOutOfRange, asInt(.{ .real = std.math.nan(f64) }));
+    try std.testing.expectError(error.IntegerOutOfRange, asInt(.{ .real = std.math.inf(f64) }));
+}
+
+test "year null grouping and modify column semantics" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-value-semantics-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+
+    var r = try execute(allocator, &db, "create table year_rows (id int primary key, yy year)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into year_rows values (1, 2019), (2, 2022), (3, 2022)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select id from year_rows where yy > 2020 order by id");
+    try std.testing.expectEqual(@as(usize, 2), r.rows.len);
+    try std.testing.expectEqualStrings("2", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("3", r.rows[1].values[0].?);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select yy from year_rows order by yy");
+    try std.testing.expectEqualStrings("2019", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("2022", r.rows[1].values[0].?);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select yy, count(*) from year_rows group by yy");
+    try std.testing.expectEqual(@as(usize, 2), r.rows.len);
+    for (r.rows) |row| {
+        const expected_count: []const u8 = if (std.mem.eql(u8, row.values[0].?, "2019")) "1" else "2";
+        try std.testing.expectEqualStrings(expected_count, row.values[1].?);
+    }
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select length(null), concat('a', null, 'b'), concat('a', 2024)");
+    try std.testing.expect(r.rows[0].values[0] == null);
+    try std.testing.expect(r.rows[0].values[1] == null);
+    try std.testing.expectEqualStrings("a2024", r.rows[0].values[2].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "create table collision_rows (id int primary key)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into collision_rows values (1), (2)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select count(*) from collision_rows group by case id when 1 then 1 else '1' end");
+    try std.testing.expectEqual(@as(usize, 2), r.rows.len);
+    for (r.rows) |row| try std.testing.expectEqualStrings("1", row.values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "create table checked_modify (v varchar(8), check (length(v) = 2))");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into checked_modify values ('01')");
+    r.deinit(allocator);
+    try std.testing.expectError(error.CheckConstraintViolation, execute(allocator, &db, "alter table checked_modify modify column v int"));
+    r = try execute(allocator, &db, "select v from checked_modify");
+    try std.testing.expectEqualStrings("01", r.rows[0].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "create table valid_modify (v varchar(8))");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into valid_modify values ('12')");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "alter table valid_modify modify column v int");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select v + 1 from valid_modify");
+    defer r.deinit(allocator);
+    try std.testing.expectEqualStrings("13", r.rows[0].values[0].?);
+}
+
+test "text ordering time division and version variables follow mysql semantics" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-runtime-semantics-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+
+    var r = try execute(allocator, &db, "create table text_rows (v varchar(8))");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into text_rows values ('1'), ('2'), ('10')");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select v from text_rows order by v");
+    try std.testing.expectEqualStrings("1", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("10", r.rows[1].values[0].?);
+    try std.testing.expectEqualStrings("2", r.rows[2].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select 1 / 0");
+    try std.testing.expect(r.rows[0].values[0] == null);
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select @@version_comment");
+    try std.testing.expectEqualStrings("@@version_comment", r.columns[0].name);
+    try std.testing.expectEqualStrings("mysqlzig", r.rows[0].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select now(), current_date, current_timestamp");
+    try std.testing.expect(!std.mem.eql(u8, r.rows[0].values[0].?, "2026-07-07 00:00:00"));
+    try std.testing.expect(!std.mem.eql(u8, r.rows[0].values[1].?, "2026-07-07"));
+    try std.testing.expect(isDateTime(r.rows[0].values[0].?));
+    try std.testing.expect(isDate(r.rows[0].values[1].?));
+    try std.testing.expect(isDateTime(r.rows[0].values[2].?));
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "create table timestamp_rows (id int, created_at timestamp default current_timestamp)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into timestamp_rows (id) values (1)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select created_at from timestamp_rows");
+    defer r.deinit(allocator);
+    try std.testing.expect(isDateTime(r.rows[0].values[0].?));
+    try std.testing.expect(!std.mem.eql(u8, r.rows[0].values[0].?, "2026-07-07 00:00:00"));
 }
