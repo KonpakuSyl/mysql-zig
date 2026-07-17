@@ -236,7 +236,7 @@ pub const Server = struct {
                         self.storage_mutex.lockUncancelable(io);
                         const cloned = self.storage.clone() catch |err| {
                             self.storage_mutex.unlock(io);
-                            logRequestError("begin", err);
+                            logRequestError("begin", err, query);
                             try conn.writeErr(1064, @errorName(err));
                             continue;
                         };
@@ -278,7 +278,7 @@ pub const Server = struct {
                     };
                     const result = sql.execute(self.allocator, target_storage, query) catch |err| {
                         if (tx_storage == null) self.storage_mutex.unlock(io);
-                        logRequestError("query", err);
+                        if (!isExpectedClientProbe(query)) logRequestError("query", err, query);
                         try conn.writeErr(mysqlErrorCode(err), @errorName(err));
                         continue;
                     };
@@ -294,13 +294,13 @@ pub const Server = struct {
                     const statement_id = next_statement_id;
                     next_statement_id +%= 1;
                     var stmt = PreparedStatement.init(self.allocator, query) catch |err| {
-                        logRequestError("prepare", err);
+                        logRequestError("prepare", err, query);
                         try conn.writeErr(1064, @errorName(err));
                         continue;
                     };
                     prepared.put(statement_id, stmt) catch |err| {
                         stmt.deinit(self.allocator);
-                        logRequestError("prepare", err);
+                        logRequestError("prepare", err, query);
                         try conn.writeErr(1064, @errorName(err));
                         continue;
                     };
@@ -308,7 +308,7 @@ pub const Server = struct {
                 },
                 protocol.command_stmt_execute => {
                     const exec = parseStmtExecute(self.allocator, packet.payload, &prepared) catch |err| {
-                        logRequestError("execute", err);
+                        logRequestError("execute", err, preparedQueryForExecute(packet.payload, &prepared));
                         try conn.writeErr(1064, @errorName(err));
                         continue;
                     };
@@ -320,7 +320,7 @@ pub const Server = struct {
                     };
                     const result = sql.execute(self.allocator, target_storage, exec) catch |err| {
                         if (tx_storage == null) self.storage_mutex.unlock(io);
-                        logRequestError("execute", err);
+                        logRequestError("execute", err, exec);
                         try conn.writeErr(mysqlErrorCode(err), @errorName(err));
                         continue;
                     };
@@ -342,7 +342,7 @@ pub const Server = struct {
                 },
                 protocol.command_stmt_reset => {
                     resetPreparedStatement(&prepared, packet.payload) catch |err| {
-                        logRequestError("reset", err);
+                        logRequestError("reset", err, null);
                         try conn.writeErr(1064, @errorName(err));
                         continue;
                     };
@@ -350,7 +350,7 @@ pub const Server = struct {
                 },
                 protocol.command_stmt_send_long_data => {
                     appendStmtLongData(self.allocator, &prepared, packet.payload) catch |err| {
-                        logRequestError("long-data", err);
+                        logRequestError("long-data", err, null);
                         try conn.writeErr(1064, @errorName(err));
                         continue;
                     };
@@ -366,8 +366,24 @@ fn logConnectionError(stage: []const u8, err: anyerror) void {
     std.log.warn("mysqlzig connection stage={s} error={s}", .{ stage, @errorName(err) });
 }
 
-fn logRequestError(operation: []const u8, err: anyerror) void {
-    std.log.warn("mysqlzig request operation={s} error={s}", .{ operation, @errorName(err) });
+fn logRequestError(operation: []const u8, err: anyerror, query: ?[]const u8) void {
+    if (query) |text| {
+        std.log.warn("mysqlzig request operation={s} error={s} sql=\"{s}\"", .{ operation, @errorName(err), text });
+    } else {
+        std.log.warn("mysqlzig request operation={s} error={s}", .{ operation, @errorName(err) });
+    }
+}
+
+fn preparedQueryForExecute(payload: []const u8, prepared: *const std.AutoHashMap(u32, PreparedStatement)) ?[]const u8 {
+    if (payload.len < 5) return null;
+    const statement_id = readLe(u32, payload[1..5]);
+    const stmt = prepared.get(statement_id) orelse return null;
+    return stmt.query;
+}
+
+fn isExpectedClientProbe(query: []const u8) bool {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n;");
+    return std.ascii.eqlIgnoreCase(trimmed, "select $$");
 }
 
 fn isExpectedDisconnect(err: anyerror) bool {
@@ -653,6 +669,8 @@ test "prepared statement long data is accumulated and cleared" {
     }
 
     try prepared.put(1, try PreparedStatement.init(allocator, "insert into game_config (content,id) values (?,?)"));
+    const execute_header = [_]u8{ 0x17, 1, 0, 0, 0 };
+    try std.testing.expectEqualStrings("insert into game_config (content,id) values (?,?)", preparedQueryForExecute(&execute_header, &prepared).?);
     const first_chunk = [_]u8{ 0x18, 1, 0, 0, 0, 0, 0, 'l', 'a', 'r', 'g', 'e', ' ' };
     const second_chunk = [_]u8{ 0x18, 1, 0, 0, 0, 0, 0, 'j', 's', 'o', 'n' };
     try appendStmtLongData(allocator, &prepared, &first_chunk);
@@ -679,4 +697,10 @@ test "prepared statement long data is accumulated and cleared" {
     const reset = [_]u8{ 0x1a, 1, 0, 0, 0 };
     try resetPreparedStatement(&prepared, &reset);
     try std.testing.expect(prepared.getPtr(1).?.long_data[0] == null);
+}
+
+test "mysql cli dollar quote probe is expected" {
+    try std.testing.expect(isExpectedClientProbe("select $$"));
+    try std.testing.expect(isExpectedClientProbe(" SELECT $$;\r\n"));
+    try std.testing.expect(!isExpectedClientProbe("select '$$'"));
 }

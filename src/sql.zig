@@ -55,8 +55,8 @@ const Statement = sql_ast.Statement;
 pub fn execute(allocator: std.mem.Allocator, db: *storage.Storage, query: []const u8) !Result {
     const trimmed = trimSemi(std.mem.trim(u8, query, " \t\r\n"));
     if (trimmed.len == 0) return ok();
-    if (std.ascii.eqlIgnoreCase(trimmed, "select @@version")) return singleColumnRows(allocator, "@@version", &.{"8.0.46-mysqlzig"});
-    if (std.ascii.eqlIgnoreCase(trimmed, "select @@version_comment")) return singleColumnRows(allocator, "@@version_comment", &.{"mysqlzig"});
+    if (isSystemVariableSelect(trimmed, "@@version")) return singleColumnRows(allocator, "@@version", &.{"8.0.46-mysqlzig"});
+    if (isSystemVariableSelect(trimmed, "@@version_comment")) return singleColumnRows(allocator, "@@version_comment", &.{"mysqlzig"});
     if (startsWith(trimmed, "select database()")) return singleColumnRows(allocator, "DATABASE()", &.{"main"});
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -79,6 +79,14 @@ pub fn execute(allocator: std.mem.Allocator, db: *storage.Storage, query: []cons
         .show_variables => |pattern| showVariables(allocator, pattern),
         .show_create_database => |name| showCreateDatabase(allocator, name),
     };
+}
+
+fn isSystemVariableSelect(query: []const u8, variable: []const u8) bool {
+    var buf: [64]u8 = undefined;
+    const plain = std.fmt.bufPrint(&buf, "select {s}", .{variable}) catch return false;
+    if (std.ascii.eqlIgnoreCase(query, plain)) return true;
+    const limited = std.fmt.bufPrint(&buf, "select {s} limit 1", .{variable}) catch return false;
+    return std.ascii.eqlIgnoreCase(query, limited);
 }
 
 fn executeMutation(allocator: std.mem.Allocator, db: *storage.Storage, stmt: Statement) !Result {
@@ -2538,6 +2546,10 @@ test "text ordering time division and version variables follow mysql semantics" 
     r.deinit(allocator);
     r = try execute(allocator, &db, "select @@version_comment");
     try std.testing.expectEqualStrings("@@version_comment", r.columns[0].name);
+    try std.testing.expectEqualStrings("mysqlzig", r.rows[0].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select @@version_comment limit 1");
     try std.testing.expectEqualStrings("mysqlzig", r.rows[0].values[0].?);
     r.deinit(allocator);
 
