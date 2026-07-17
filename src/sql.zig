@@ -90,23 +90,73 @@ fn isSystemVariableSelect(query: []const u8, variable: []const u8) bool {
 }
 
 fn executeMutation(allocator: std.mem.Allocator, db: *storage.Storage, stmt: Statement) !Result {
+    // DML touches exactly one existing table, so snapshot just that table
+    // (clone -> mutate the clone in place -> swap on success / discard on error).
+    // This keeps statement-level atomicity while making writes cost O(target
+    // table) instead of O(whole database).
+    switch (stmt) {
+        .insert => |s| return mutateSingleTable(allocator, db, s.table, stmt),
+        .update => |s| return mutateSingleTable(allocator, db, s.table, stmt),
+        .delete => |s| return mutateSingleTable(allocator, db, s.table, stmt),
+        .truncate_table => |name| return mutateSingleTable(allocator, db, name, stmt),
+        else => {},
+    }
+
+    // DDL (create/drop/alter/index) can add or remove tables, so keep the proven
+    // whole-database clone-and-swap for its simpler, safe rollback semantics.
     var next = try db.clone();
     errdefer next.deinit();
-
     var result = switch (stmt) {
-        .insert => |s| try insertInto(&next, s),
-        .update => |s| try updateRows(allocator, &next, s),
-        .delete => |s| try deleteFrom(allocator, &next, s),
         .create_table => |s| try createTable(&next, s.name, s.columns, s.indexes, s.checks, s.if_not_exists),
         .create_index => |s| try createIndex(&next, s),
         .drop_index => |s| try dropIndex(&next, s),
         .alter_table => |s| try alterTable(&next, s.table, s.action),
         .drop_table => |s| try dropTable(&next, s.name, s.if_exists),
-        .truncate_table => |name| try truncateTable(&next, name),
         else => unreachable,
     };
     db.deinit();
     db.* = next;
+    result.mutated = true;
+    return result;
+}
+
+fn runSingleTableMutation(allocator: std.mem.Allocator, db: *storage.Storage, stmt: Statement) !Result {
+    return switch (stmt) {
+        .insert => |s| insertInto(db, s),
+        .update => |s| updateRows(allocator, db, s),
+        .delete => |s| deleteFrom(allocator, db, s),
+        .truncate_table => |name| truncateTable(db, name),
+        else => unreachable,
+    };
+}
+
+fn mutateSingleTable(allocator: std.mem.Allocator, db: *storage.Storage, table_name: []const u8, stmt: Statement) !Result {
+    const ti = db.findTableIndex(table_name) orelse {
+        // Unknown table: run directly so the mutation function returns the
+        // proper error without touching any storage.
+        var result = try runSingleTableMutation(allocator, db, stmt);
+        result.mutated = true;
+        return result;
+    };
+
+    // Snapshot the target table into an independent working copy, install it in
+    // place, then run the mutation against it. DML never adds/removes tables, so
+    // `ti` stays valid for the whole operation.
+    const original = db.tables.items[ti];
+    const working = try db.cloneTableValue(original);
+    db.tables.items[ti] = working;
+
+    var result = runSingleTableMutation(allocator, db, stmt) catch |err| {
+        // Roll back: discard the (partially) mutated working copy and restore
+        // the untouched original.
+        db.destroyTable(&db.tables.items[ti]);
+        db.tables.items[ti] = original;
+        return err;
+    };
+
+    // Commit: free the original snapshot; the working copy stays installed.
+    var original_copy = original;
+    db.destroyTable(&original_copy);
     result.mutated = true;
     return result;
 }
@@ -686,6 +736,10 @@ fn makeVirtualTable(allocator: std.mem.Allocator, name: []const u8, cols: []cons
         .checks = std.array_list.Managed(storage.CheckConstraint).init(allocator),
         .rows = std.array_list.Managed(storage.Row).init(allocator),
         .indexes = std.array_list.Managed(storage.Index).init(allocator),
+        // Virtual tables live on the caller's scratch arena and never persist
+        // bytes or go through deinitTable, so the per-table arena is unused.
+        .arena = undefined,
+        .row_index = std.AutoHashMap(storage.RowId, usize).init(allocator),
     };
     return table;
 }
@@ -693,7 +747,9 @@ fn makeVirtualTable(allocator: std.mem.Allocator, name: []const u8, cols: []cons
 fn appendVirtualRow(allocator: std.mem.Allocator, table: *storage.Table, values: []const storage.Value) !void {
     const row_values = try allocator.alloc(storage.Value, values.len);
     @memcpy(row_values, values);
-    try table.rows.append(.{ .id = @intCast(table.rows.items.len + 1), .values = row_values });
+    const id: storage.RowId = @intCast(table.rows.items.len + 1);
+    try table.row_index.put(id, table.rows.items.len);
+    try table.rows.append(.{ .id = id, .values = row_values });
 }
 
 fn buildInformationSchemaSchemata(allocator: std.mem.Allocator) !*storage.Table {
@@ -786,7 +842,7 @@ fn selectNoTable(allocator: std.mem.Allocator, stmt: SelectStmt) !Result {
     var temp_arena = std.heap.ArenaAllocator.init(allocator);
     defer temp_arena.deinit();
     const temp = temp_arena.allocator();
-    const dummy_table = storage.Table{ .name = "", .columns = &.{}, .checks = undefined, .rows = undefined, .indexes = undefined };
+    const dummy_table = storage.Table{ .name = "", .columns = &.{}, .checks = undefined, .rows = undefined, .indexes = undefined, .arena = undefined, .row_index = undefined };
     const dummy_row = storage.Row{ .id = 0, .values = &.{} };
     const ctx = RowContext{ .left_table = &dummy_table, .left_row = &dummy_row };
     for (stmt.items, 0..) |item, i| {

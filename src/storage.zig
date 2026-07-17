@@ -107,6 +107,15 @@ pub const Table = struct {
     next_row_id: RowId = 1,
     rows: std.array_list.Managed(Row),
     indexes: std.array_list.Managed(Index),
+    // Per-table arena owning every string/byte slice referenced by this table
+    // (name, column names, values, check/index names). Cloning a single table
+    // and swapping it in reclaims the old arena, so in-place mutation cannot
+    // leak. `undefined` for short-lived virtual tables that never persist bytes.
+    arena: std.heap.ArenaAllocator,
+    // Maps row id -> index into `rows.items` for O(1) point lookups. Indices are
+    // stable because rows are soft-deleted (never physically removed) and only
+    // appended, so the map only needs maintenance on append/truncate/clone.
+    row_index: std.AutoHashMap(RowId, usize),
 };
 
 pub const Assignment = struct {
@@ -117,7 +126,6 @@ pub const Assignment = struct {
 pub const Storage = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    byte_arena: std.heap.ArenaAllocator,
     dump_path: []const u8,
     tables: std.array_list.Managed(Table),
 
@@ -125,7 +133,6 @@ pub const Storage = struct {
         var storage = Storage{
             .allocator = allocator,
             .io = io,
-            .byte_arena = .init(allocator),
             .dump_path = dump_path,
             .tables = std.array_list.Managed(Table).init(allocator),
         };
@@ -137,7 +144,6 @@ pub const Storage = struct {
     pub fn deinit(self: *Storage) void {
         for (self.tables.items) |*table| self.deinitTable(table);
         self.tables.deinit();
-        self.byte_arena.deinit();
         self.* = undefined;
     }
 
@@ -145,50 +151,91 @@ pub const Storage = struct {
         var out = Storage{
             .allocator = self.allocator,
             .io = self.io,
-            .byte_arena = .init(self.allocator),
             .dump_path = self.dump_path,
             .tables = std.array_list.Managed(Table).init(self.allocator),
         };
         errdefer out.deinit();
         for (self.tables.items) |table| {
-            try out.cloneTable(table);
+            var cloned = try self.cloneTableValue(table);
+            errdefer self.deinitTable(&cloned);
+            try out.tables.append(cloned);
         }
         return out;
     }
 
-    fn cloneTable(self: *Storage, source: Table) !void {
-        const name = try self.persistBytes(source.name);
+    /// Produces a fully independent deep copy of `source` (its own arena, row
+    /// arrays, indexes and row-index map). Used both by whole-database clone
+    /// (DDL) and by the per-statement single-table snapshot (DML). Each piece is
+    /// tracked by its own errdefer so a mid-way failure frees everything exactly
+    /// once; on success ownership is transferred into the returned Table.
+    pub fn cloneTableValue(self: *Storage, source: Table) !Table {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        const name = try persistBytes(a, source.name);
+
         const columns = try self.allocator.alloc(Column, source.columns.len);
         errdefer self.allocator.free(columns);
-        for (source.columns, 0..) |col, i| columns[i] = try self.persistColumn(col);
+        for (source.columns, 0..) |col, i| columns[i] = try self.persistColumn(a, col);
+
+        var checks = std.array_list.Managed(CheckConstraint).init(self.allocator);
+        errdefer checks.deinit();
+        for (source.checks.items) |check| {
+            try checks.append(.{
+                .name = try persistBytes(a, check.name),
+                .expr_sql = try persistBytes(a, check.expr_sql),
+            });
+        }
+
+        var indexes = std.array_list.Managed(Index).init(self.allocator);
+        errdefer {
+            for (indexes.items) |*index| index.deinit();
+            indexes.deinit();
+        }
+        for (source.indexes.items) |index| {
+            try indexes.append(try Index.init(self.allocator, try persistBytes(a, index.name), index.columns, index.unique, index.primary));
+        }
+
+        var rows = std.array_list.Managed(Row).init(self.allocator);
+        errdefer {
+            for (rows.items) |row| self.allocator.free(row.values);
+            rows.deinit();
+        }
+        var row_index = std.AutoHashMap(RowId, usize).init(self.allocator);
+        errdefer row_index.deinit();
+        for (source.rows.items) |row| {
+            const values = try self.allocator.alloc(Value, row.values.len);
+            errdefer self.allocator.free(values);
+            for (row.values, 0..) |value, i| values[i] = try persistValue(a, value);
+            try rows.append(.{ .id = row.id, .deleted = row.deleted, .values = values });
+            try row_index.put(row.id, rows.items.len - 1);
+        }
 
         var table = Table{
             .name = name,
             .columns = columns,
-            .checks = std.array_list.Managed(CheckConstraint).init(self.allocator),
+            .checks = checks,
             .next_row_id = source.next_row_id,
-            .rows = std.array_list.Managed(Row).init(self.allocator),
-            .indexes = std.array_list.Managed(Index).init(self.allocator),
+            .rows = rows,
+            .indexes = indexes,
+            .arena = arena,
+            .row_index = row_index,
         };
-        errdefer self.deinitTable(&table);
-
-        for (source.checks.items) |check| {
-            try table.checks.append(.{
-                .name = try self.persistBytes(check.name),
-                .expr_sql = try self.persistBytes(check.expr_sql),
-            });
-        }
-        for (source.indexes.items) |index| {
-            try table.indexes.append(try Index.init(self.allocator, try self.persistBytes(index.name), index.columns, index.unique, index.primary));
-        }
-        for (source.rows.items) |row| {
-            const values = try self.allocator.alloc(Value, row.values.len);
-            errdefer self.allocator.free(values);
-            for (row.values, 0..) |value, i| values[i] = try self.persistValue(value);
-            try table.rows.append(.{ .id = row.id, .deleted = row.deleted, .values = values });
-        }
         try rebuildIndexes(&table);
-        try self.tables.append(table);
+        return table;
+    }
+
+    pub fn findTableIndex(self: *Storage, name: []const u8) ?usize {
+        for (self.tables.items, 0..) |*table, i| {
+            if (std.ascii.eqlIgnoreCase(table.name, name)) return i;
+        }
+        return null;
+    }
+
+    /// Public wrapper so the executor can free a snapshot/working table.
+    pub fn destroyTable(self: *Storage, table: *Table) void {
+        self.deinitTable(table);
     }
 
     pub fn flush(self: *Storage) !void {
@@ -253,11 +300,14 @@ pub const Storage = struct {
 
     pub fn createTable(self: *Storage, name: []const u8, columns: []const Column) !void {
         if (self.findTable(name) != null) return error.TableExists;
-        const table_name = try self.persistBytes(name);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const table_name = try persistBytes(a, name);
         const stored_columns = try self.allocator.alloc(Column, columns.len);
         errdefer self.allocator.free(stored_columns);
         for (columns, 0..) |col, i| {
-            stored_columns[i] = try self.persistColumn(col);
+            stored_columns[i] = try self.persistColumn(a, col);
         }
         try self.tables.append(.{
             .name = table_name,
@@ -265,6 +315,8 @@ pub const Storage = struct {
             .checks = std.array_list.Managed(CheckConstraint).init(self.allocator),
             .rows = std.array_list.Managed(Row).init(self.allocator),
             .indexes = std.array_list.Managed(Index).init(self.allocator),
+            .arena = arena,
+            .row_index = std.AutoHashMap(RowId, usize).init(self.allocator),
         });
     }
 
@@ -282,6 +334,7 @@ pub const Storage = struct {
     pub fn truncateTable(self: *Storage, table: *Table) void {
         for (table.rows.items) |row| self.allocator.free(row.values);
         table.rows.clearRetainingCapacity();
+        table.row_index.clearRetainingCapacity();
         table.next_row_id = 1;
         for (table.indexes.items) |*index| clearIndexBuckets(index);
     }
@@ -293,7 +346,7 @@ pub const Storage = struct {
     pub fn createIndexEx(self: *Storage, table: *Table, name: []const u8, columns: []const usize, unique: bool, primary: bool) !void {
         if (findIndexInTable(table, name) != null) return error.IndexExists;
         if (columns.len == 0) return error.EmptyIndex;
-        const index_name = try self.persistBytes(name);
+        const index_name = try persistBytes(table.arena.allocator(), name);
         var index = try Index.init(self.allocator, index_name, columns, unique or primary, primary);
         errdefer index.deinit();
         for (table.rows.items) |row| {
@@ -315,10 +368,12 @@ pub const Storage = struct {
     }
 
     pub fn addCheck(self: *Storage, table: *Table, name: []const u8, expr_sql: []const u8) !void {
+        _ = self;
         if (findCheckInTable(table, name) != null) return error.CheckExists;
+        const a = table.arena.allocator();
         try table.checks.append(.{
-            .name = try self.persistBytes(name),
-            .expr_sql = try self.persistBytes(expr_sql),
+            .name = try persistBytes(a, name),
+            .expr_sql = try persistBytes(a, expr_sql),
         });
     }
 
@@ -335,11 +390,14 @@ pub const Storage = struct {
 
     pub fn insertRow(self: *Storage, table: *Table, input: []const Value) !RowId {
         if (input.len != table.columns.len) return error.ColumnCountMismatch;
+        const a = table.arena.allocator();
         const values = try self.allocator.alloc(Value, input.len);
         errdefer self.allocator.free(values);
-        for (input, 0..) |value, i| values[i] = try self.persistValue(value);
+        for (input, 0..) |value, i| values[i] = try persistValue(a, value);
         try checkUniqueIndexes(table, values, null);
         const id = table.next_row_id;
+        try table.row_index.put(id, table.rows.items.len);
+        errdefer _ = table.row_index.remove(id);
         table.next_row_id += 1;
         try table.rows.append(.{ .id = id, .values = values });
         const row = &table.rows.items[table.rows.items.len - 1];
@@ -349,11 +407,12 @@ pub const Storage = struct {
 
     pub fn updateRow(self: *Storage, table: *Table, row: *Row, assignments: []const Assignment) !void {
         if (row.deleted) return;
+        const a = table.arena.allocator();
         const new_values = try self.allocator.alloc(Value, row.values.len);
         errdefer self.allocator.free(new_values);
         @memcpy(new_values, row.values);
         for (assignments) |assignment| {
-            new_values[assignment.column_index] = try self.persistValue(assignment.value);
+            new_values[assignment.column_index] = try persistValue(a, assignment.value);
         }
         try checkUniqueIndexes(table, new_values, row.id);
         for (table.indexes.items) |*index| {
@@ -412,6 +471,11 @@ pub const Storage = struct {
     }
 
     pub fn findRowById(table: *Table, id: RowId) ?*Row {
+        if (table.row_index.get(id)) |idx| {
+            if (idx < table.rows.items.len and table.rows.items[idx].id == id) return &table.rows.items[idx];
+        }
+        // Fallback keeps correctness even if the map is empty/stale (e.g. virtual
+        // tables that only append via appendVirtualRow without map maintenance).
         for (table.rows.items) |*row| {
             if (row.id == id) return row;
         }
@@ -433,16 +497,17 @@ pub const Storage = struct {
     }
 
     pub fn addColumn(self: *Storage, table: *Table, column: Column, fill_value: Value) !void {
+        const a = table.arena.allocator();
         const new_columns = try self.allocator.alloc(Column, table.columns.len + 1);
         @memcpy(new_columns[0..table.columns.len], table.columns);
-        new_columns[table.columns.len] = try self.persistColumn(column);
+        new_columns[table.columns.len] = try self.persistColumn(a, column);
         self.allocator.free(table.columns);
         table.columns = new_columns;
         for (table.rows.items) |*row| {
             const old_values = row.values;
             const new_values = try self.allocator.alloc(Value, old_values.len + 1);
             @memcpy(new_values[0..old_values.len], old_values);
-            new_values[old_values.len] = try self.persistValue(fill_value);
+            new_values[old_values.len] = try persistValue(a, fill_value);
             self.allocator.free(old_values);
             row.values = new_values;
         }
@@ -450,16 +515,18 @@ pub const Storage = struct {
     }
 
     pub fn renameColumn(self: *Storage, table: *Table, column_index: usize, new_name: []const u8) !void {
+        _ = self;
         if (Storage.columnIndex(table, new_name) != null) return error.ColumnExists;
-        table.columns[column_index].name = try self.persistBytes(new_name);
+        table.columns[column_index].name = try persistBytes(table.arena.allocator(), new_name);
     }
 
     pub fn replaceColumn(self: *Storage, table: *Table, column_index: usize, column: Column, values: []const Value) !void {
         if (values.len != table.rows.items.len) return error.ColumnCountMismatch;
+        const a = table.arena.allocator();
         self.deinitKind(table.columns[column_index].kind);
-        table.columns[column_index] = try self.persistColumn(column);
+        table.columns[column_index] = try self.persistColumn(a, column);
         for (table.rows.items, 0..) |*row, i| {
-            row.values[column_index] = try self.persistValue(values[i]);
+            row.values[column_index] = try persistValue(a, values[i]);
         }
         try rebuildIndexes(table);
     }
@@ -498,59 +565,38 @@ pub const Storage = struct {
 
     pub fn renameTable(self: *Storage, table: *Table, new_name: []const u8) !void {
         if (self.findTable(new_name) != null) return error.TableExists;
-        table.name = try self.persistBytes(new_name);
+        table.name = try persistBytes(table.arena.allocator(), new_name);
     }
 
     pub fn findIndex(table: *Table, name: []const u8) ?*Index {
         return findIndexInTable(table, name);
     }
 
-    fn persistValue(self: *Storage, value: Value) !Value {
-        return switch (value) {
-            .null => .null,
-            .int => |v| .{ .int = v },
-            .bool => |v| .{ .bool = v },
-            .real => |v| .{ .real = v },
-            .text => |v| .{ .text = try self.persistBytes(v) },
-            .decimal => |v| .{ .decimal = try self.persistBytes(v) },
-            .blob => |v| .{ .blob = try self.persistBytes(v) },
-            .date => |v| .{ .date = try self.persistBytes(v) },
-            .datetime => |v| .{ .datetime = try self.persistBytes(v) },
-            .time => |v| .{ .time = try self.persistBytes(v) },
-            .year => |v| .{ .year = v },
-            .json => |v| .{ .json = try self.persistBytes(v) },
-        };
-    }
-
-    fn persistColumn(self: *Storage, col: Column) !Column {
+    fn persistColumn(self: *Storage, arena: std.mem.Allocator, col: Column) !Column {
         return .{
-            .name = try self.persistBytes(col.name),
-            .kind = try self.persistKind(col.kind),
+            .name = try persistBytes(arena, col.name),
+            .kind = try self.persistKind(arena, col.kind),
             .unsigned = col.unsigned,
             .nullable = col.nullable,
-            .default_value = if (col.default_value) |value| try self.persistValue(value) else null,
+            .default_value = if (col.default_value) |value| try persistValue(arena, value) else null,
             .auto_increment = col.auto_increment,
             .primary = col.primary,
             .unique = col.unique,
         };
     }
 
-    fn persistKind(self: *Storage, kind: Column.Kind) !Column.Kind {
+    fn persistKind(self: *Storage, arena: std.mem.Allocator, kind: Column.Kind) !Column.Kind {
         return switch (kind) {
-            .enum_values => |values| .{ .enum_values = try self.persistStringList(values) },
-            .set_values => |values| .{ .set_values = try self.persistStringList(values) },
+            .enum_values => |values| .{ .enum_values = try self.persistStringList(arena, values) },
+            .set_values => |values| .{ .set_values = try self.persistStringList(arena, values) },
             else => kind,
         };
     }
 
-    fn persistStringList(self: *Storage, values: []const []const u8) ![]const []const u8 {
+    fn persistStringList(self: *Storage, arena: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
         const out = try self.allocator.alloc([]const u8, values.len);
-        for (values, 0..) |value, i| out[i] = try self.persistBytes(value);
+        for (values, 0..) |value, i| out[i] = try persistBytes(arena, value);
         return out;
-    }
-
-    fn persistBytes(self: *Storage, bytes: []const u8) ![]const u8 {
-        return self.byte_arena.allocator().dupe(u8, bytes);
     }
 
     fn restore(self: *Storage) !void {
@@ -572,7 +618,10 @@ pub const Storage = struct {
 
         var ti: usize = 0;
         while (ti < table_count) : (ti += 1) {
-            const name = try self.persistBytes(try readString(bytes, &cur));
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            const name = try persistBytes(a, try readString(bytes, &cur));
             const next_row_id = readLe(u64, bytes[cur .. cur + 8]);
             cur += 8;
             const col_count = readLe(u32, bytes[cur .. cur + 4]);
@@ -580,8 +629,8 @@ pub const Storage = struct {
             const columns = try self.allocator.alloc(Column, col_count);
             errdefer self.allocator.free(columns);
             for (columns) |*col| {
-                col.name = try self.persistBytes(try readString(bytes, &cur));
-                col.kind = try self.readKind(bytes, &cur);
+                col.name = try persistBytes(a, try readString(bytes, &cur));
+                col.kind = try self.readKind(a, bytes, &cur);
                 if (cur + 6 > bytes.len) return error.BadDump;
                 col.unsigned = bytes[cur] != 0;
                 cur += 1;
@@ -595,37 +644,34 @@ pub const Storage = struct {
                 cur += 1;
                 if (bytes[cur] != 0) {
                     cur += 1;
-                    col.default_value = try self.readPersistedValue(bytes, &cur);
+                    col.default_value = try self.readPersistedValue(a, bytes, &cur);
                 } else {
                     cur += 1;
                     col.default_value = null;
                 }
             }
-            var table = Table{
-                .name = name,
-                .columns = columns,
-                .checks = std.array_list.Managed(CheckConstraint).init(self.allocator),
-                .next_row_id = next_row_id,
-                .rows = std.array_list.Managed(Row).init(self.allocator),
-                .indexes = std.array_list.Managed(Index).init(self.allocator),
-            };
-            errdefer self.deinitTable(&table);
-
+            var checks = std.array_list.Managed(CheckConstraint).init(self.allocator);
+            errdefer checks.deinit();
             const check_count = readLe(u32, bytes[cur .. cur + 4]);
             cur += 4;
             var ci: usize = 0;
             while (ci < check_count) : (ci += 1) {
-                try table.checks.append(.{
-                    .name = try self.persistBytes(try readString(bytes, &cur)),
-                    .expr_sql = try self.persistBytes(try readString(bytes, &cur)),
+                try checks.append(.{
+                    .name = try persistBytes(a, try readString(bytes, &cur)),
+                    .expr_sql = try persistBytes(a, try readString(bytes, &cur)),
                 });
             }
 
+            var indexes = std.array_list.Managed(Index).init(self.allocator);
+            errdefer {
+                for (indexes.items) |*index| index.deinit();
+                indexes.deinit();
+            }
             const index_count = readLe(u32, bytes[cur .. cur + 4]);
             cur += 4;
             var ii: usize = 0;
             while (ii < index_count) : (ii += 1) {
-                const index_name = try self.persistBytes(try readString(bytes, &cur));
+                const index_name = try persistBytes(a, try readString(bytes, &cur));
                 const index_column_count = readLe(u32, bytes[cur .. cur + 4]);
                 cur += 4;
                 const index_columns = try self.allocator.alloc(usize, index_column_count);
@@ -641,9 +687,16 @@ pub const Storage = struct {
                 cur += 1;
                 const primary = bytes[cur] != 0;
                 cur += 1;
-                try table.indexes.append(try Index.init(self.allocator, index_name, index_columns, unique, primary));
+                try indexes.append(try Index.init(self.allocator, index_name, index_columns, unique, primary));
             }
 
+            var rows = std.array_list.Managed(Row).init(self.allocator);
+            errdefer {
+                for (rows.items) |row| self.allocator.free(row.values);
+                rows.deinit();
+            }
+            var row_index = std.AutoHashMap(RowId, usize).init(self.allocator);
+            errdefer row_index.deinit();
             const row_count = readLe(u32, bytes[cur .. cur + 4]);
             cur += 4;
             var ri: usize = 0;
@@ -655,15 +708,28 @@ pub const Storage = struct {
                 cur += 1;
                 const values = try self.allocator.alloc(Value, col_count);
                 errdefer self.allocator.free(values);
-                for (values) |*value| value.* = try self.readPersistedValue(bytes, &cur);
-                try table.rows.append(.{ .id = id, .deleted = deleted, .values = values });
+                for (values) |*value| value.* = try self.readPersistedValue(a, bytes, &cur);
+                try rows.append(.{ .id = id, .deleted = deleted, .values = values });
+                try row_index.put(id, rows.items.len - 1);
             }
+
+            var table = Table{
+                .name = name,
+                .columns = columns,
+                .checks = checks,
+                .next_row_id = next_row_id,
+                .rows = rows,
+                .indexes = indexes,
+                .arena = arena,
+                .row_index = row_index,
+            };
             try rebuildIndexes(&table);
             try self.tables.append(table);
         }
     }
 
-    fn readPersistedValue(self: *Storage, bytes: []const u8, cur: *usize) !Value {
+    fn readPersistedValue(self: *Storage, arena: std.mem.Allocator, bytes: []const u8, cur: *usize) !Value {
+        _ = self;
         if (cur.* >= bytes.len) return error.BadDump;
         const tag = bytes[cur.*];
         cur.* += 1;
@@ -675,7 +741,7 @@ pub const Storage = struct {
                 cur.* += 8;
                 break :blk .{ .int = v };
             },
-            2 => .{ .text = try self.persistBytes(try readString(bytes, cur)) },
+            2 => .{ .text = try persistBytes(arena, try readString(bytes, cur)) },
             3 => blk: {
                 if (cur.* >= bytes.len) return error.BadDump;
                 const v = bytes[cur.*] != 0;
@@ -688,18 +754,18 @@ pub const Storage = struct {
                 cur.* += 8;
                 break :blk .{ .real = @bitCast(raw) };
             },
-            5 => .{ .decimal = try self.persistBytes(try readString(bytes, cur)) },
-            6 => .{ .blob = try self.persistBytes(try readString(bytes, cur)) },
-            7 => .{ .date = try self.persistBytes(try readString(bytes, cur)) },
-            8 => .{ .datetime = try self.persistBytes(try readString(bytes, cur)) },
-            9 => .{ .time = try self.persistBytes(try readString(bytes, cur)) },
+            5 => .{ .decimal = try persistBytes(arena, try readString(bytes, cur)) },
+            6 => .{ .blob = try persistBytes(arena, try readString(bytes, cur)) },
+            7 => .{ .date = try persistBytes(arena, try readString(bytes, cur)) },
+            8 => .{ .datetime = try persistBytes(arena, try readString(bytes, cur)) },
+            9 => .{ .time = try persistBytes(arena, try readString(bytes, cur)) },
             10 => blk: {
                 if (cur.* + 4 > bytes.len) return error.BadDump;
                 const v = readLe(i32, bytes[cur.* .. cur.* + 4]);
                 cur.* += 4;
                 break :blk .{ .year = v };
             },
-            11 => .{ .json = try self.persistBytes(try readString(bytes, cur)) },
+            11 => .{ .json = try persistBytes(arena, try readString(bytes, cur)) },
             else => error.BadDump,
         };
     }
@@ -712,6 +778,8 @@ pub const Storage = struct {
         table.rows.deinit();
         for (table.indexes.items) |*index| index.deinit();
         table.indexes.deinit();
+        table.row_index.deinit();
+        table.arena.deinit();
     }
 
     fn deinitKind(self: *Storage, kind: Column.Kind) void {
@@ -722,7 +790,7 @@ pub const Storage = struct {
         }
     }
 
-    fn readKind(self: *Storage, bytes: []const u8, cur: *usize) !Column.Kind {
+    fn readKind(self: *Storage, arena: std.mem.Allocator, bytes: []const u8, cur: *usize) !Column.Kind {
         if (cur.* >= bytes.len) return error.BadDump;
         const tag = bytes[cur.*];
         cur.* += 1;
@@ -779,22 +847,43 @@ pub const Storage = struct {
             25 => .time,
             26 => .year,
             27 => .json,
-            28 => .{ .enum_values = try self.readStringList(bytes, cur) },
-            29 => .{ .set_values = try self.readStringList(bytes, cur) },
+            28 => .{ .enum_values = try self.readStringList(arena, bytes, cur) },
+            29 => .{ .set_values = try self.readStringList(arena, bytes, cur) },
             else => error.BadDump,
         };
     }
 
-    fn readStringList(self: *Storage, bytes: []const u8, cur: *usize) ![]const []const u8 {
+    fn readStringList(self: *Storage, arena: std.mem.Allocator, bytes: []const u8, cur: *usize) ![]const []const u8 {
         if (cur.* + 4 > bytes.len) return error.BadDump;
         const count = readLe(u32, bytes[cur.* .. cur.* + 4]);
         cur.* += 4;
         const out = try self.allocator.alloc([]const u8, count);
         errdefer self.allocator.free(out);
-        for (out) |*item| item.* = try self.persistBytes(try readString(bytes, cur));
+        for (out) |*item| item.* = try persistBytes(arena, try readString(bytes, cur));
         return out;
     }
 };
+
+fn persistBytes(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    return arena.dupe(u8, bytes);
+}
+
+fn persistValue(arena: std.mem.Allocator, value: Value) !Value {
+    return switch (value) {
+        .null => .null,
+        .int => |v| .{ .int = v },
+        .bool => |v| .{ .bool = v },
+        .real => |v| .{ .real = v },
+        .text => |v| .{ .text = try persistBytes(arena, v) },
+        .decimal => |v| .{ .decimal = try persistBytes(arena, v) },
+        .blob => |v| .{ .blob = try persistBytes(arena, v) },
+        .date => |v| .{ .date = try persistBytes(arena, v) },
+        .datetime => |v| .{ .datetime = try persistBytes(arena, v) },
+        .time => |v| .{ .time = try persistBytes(arena, v) },
+        .year => |v| .{ .year = v },
+        .json => |v| .{ .json = try persistBytes(arena, v) },
+    };
+}
 
 fn findIndexInTable(table: *Table, name: []const u8) ?*Index {
     for (table.indexes.items) |*index| {
@@ -876,6 +965,9 @@ fn valueEqual(left: Value, right: Value) bool {
 }
 
 fn findRowByIdConst(table: *const Table, id: RowId) ?*const Row {
+    if (table.row_index.get(id)) |idx| {
+        if (idx < table.rows.items.len and table.rows.items[idx].id == id) return &table.rows.items[idx];
+    }
     for (table.rows.items) |*row| {
         if (row.id == id) return row;
     }
