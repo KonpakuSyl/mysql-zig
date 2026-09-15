@@ -296,6 +296,7 @@ pub const Parser = struct {
                 order_by = try orders.toOwnedSlice();
             }
             limit = try self.parseOptionalLimit();
+            try self.parseOptionalLockingClause();
         }
         try self.expect(.eof);
         return .{ .items = try items.toOwnedSlice(), .table = table, .table_alias = table_alias, .join = join, .conditions = conditions, .where_expr = where_expr, .group_by = group_by, .having = having, .order_by = order_by, .limit = limit };
@@ -1058,6 +1059,24 @@ pub const Parser = struct {
         if (self.match(.comma)) return .{ .offset = first, .count = try self.expectNumber() };
         if (self.matchKeyword("offset")) return .{ .offset = try self.expectNumber(), .count = first };
         return .{ .count = first };
+    }
+
+    fn parseOptionalLockingClause(self: *Parser) !void {
+        if (self.matchKeyword("for")) {
+            if (!self.matchKeyword("update") and !self.matchKeyword("share")) return error.ExpectedKeyword;
+            try self.consumeOptionalLockWait();
+            return;
+        }
+        if (self.matchKeyword("lock")) {
+            try self.expectKeyword("in");
+            try self.expectKeyword("share");
+            try self.expectKeyword("mode");
+        }
+    }
+
+    fn consumeOptionalLockWait(self: *Parser) !void {
+        if (self.matchKeyword("nowait")) return;
+        if (self.matchKeyword("skip")) try self.expectKeyword("locked");
     }
 
     fn parseOptionalLikePattern(self: *Parser) !?[]const u8 {

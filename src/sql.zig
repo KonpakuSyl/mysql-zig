@@ -258,8 +258,27 @@ fn defaultForColumn(allocator: std.mem.Allocator, table: *const storage.Table, c
         if (try defaultValueFunction(allocator, col.kind, default_value)) |computed| return computed;
         return try coerceColumn(allocator, col, default_value);
     }
-    if (!col.nullable or col.primary) return error.NotNullViolation;
+    if (!col.nullable or col.primary) return implicitDefault(col);
     return .null;
+}
+
+fn implicitDefault(col: storage.Column) !storage.Value {
+    return switch (col.kind) {
+        .tiny_int, .small_int, .medium_int, .int, .big_int, .bit => .{ .int = 0 },
+        .bool => .{ .bool = false },
+        .real => .{ .real = 0 },
+        .year => .{ .year = 0 },
+        .decimal => .{ .decimal = "0" },
+        .text, .tiny_text, .medium_text, .long_text, .char, .varchar => .{ .text = "" },
+        .binary, .varbinary, .blob, .tiny_blob, .medium_blob, .long_blob => .{ .blob = "" },
+        .date => .{ .date = "0000-00-00" },
+        .datetime => .{ .datetime = "0000-00-00 00:00:00" },
+        .time => .{ .time = "00:00:00" },
+        .json => .{ .json = "null" },
+        .enum_values => |allowed| if (allowed.len > 0) .{ .text = allowed[0] } else .{ .text = "" },
+        .set_values => .{ .text = "" },
+        .null => .null,
+    };
 }
 
 fn defaultValueFunction(allocator: std.mem.Allocator, kind: storage.Column.Kind, value: storage.Value) !?storage.Value {
@@ -2625,4 +2644,65 @@ test "text ordering time division and version variables follow mysql semantics" 
     defer r.deinit(allocator);
     try std.testing.expect(isDateTime(r.rows[0].values[0].?));
     try std.testing.expect(!std.mem.eql(u8, r.rows[0].values[0].?, "2026-07-07 00:00:00"));
+}
+
+test "select ignores mysql row locking clauses" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-for-update-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table accounts (uuid varchar(255) primary key, device varchar(255))");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into accounts (uuid, device) values ('PAccount:1000:1111', 'phone')");
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "SELECT * FROM `accounts`  WHERE (uuid = 'PAccount:1000:1111') ORDER BY `accounts`.`uuid` ASC LIMIT 1 FOR UPDATE");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("PAccount:1000:1111", r.rows[0].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "SELECT * FROM accounts WHERE uuid = 'PAccount:1000:1111' FOR UPDATE NOWAIT");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "SELECT * FROM accounts WHERE uuid = 'PAccount:1000:1111' FOR SHARE SKIP LOCKED");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "SELECT * FROM accounts WHERE uuid = 'PAccount:1000:1111' LOCK IN SHARE MODE");
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+}
+
+test "insert fills omitted not null columns with implicit defaults" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-implicit-default-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table devices (uuid varchar(255) primary key, device varchar(255), created_at bigint, is_emulator bool)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "INSERT INTO `devices` (`device`,`created_at`,`is_emulator`) VALUES ('',1789380794,0)");
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select uuid, device, created_at, is_emulator from devices");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("", r.rows[0].values[1].?);
+    try std.testing.expectEqualStrings("1789380794", r.rows[0].values[2].?);
+    try std.testing.expectEqualStrings("0", r.rows[0].values[3].?);
+    r.deinit(allocator);
+
+    try std.testing.expectError(error.NotNullViolation, execute(allocator, &db, "insert into devices (uuid, device) values (null, 'phone')"));
 }
