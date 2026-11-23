@@ -4,6 +4,7 @@ const storage = @import("storage.zig");
 pub const Column = struct {
     name: []const u8,
     type_code: u8,
+    unsigned: bool = false,
 };
 
 pub const Row = struct {
@@ -353,6 +354,9 @@ fn alterTable(db: *storage.Storage, table_name: []const u8, action: AlterAction)
 
 fn modifyColumn(db: *storage.Storage, table: *storage.Table, old_name: []const u8, new_col: storage.Column) !void {
     const idx = storage.Storage.columnIndex(table, old_name) orelse return error.UnknownColumn;
+    if (storage.Storage.columnIndex(table, new_col.name)) |existing| {
+        if (existing != idx) return error.ColumnExists;
+    }
     var stored_col = new_col;
     for (table.indexes.items) |index| {
         if (indexContainsColumn(index, idx)) {
@@ -607,8 +611,9 @@ fn selectQuery(allocator: std.mem.Allocator, db: *storage.Storage, stmt: SelectS
     defer temp_arena.deinit();
     const temp = temp_arena.allocator();
     const table = db.findTable(stmt.table.?) orelse (try informationSchemaTable(temp, db, stmt.table.?)) orelse return error.UnknownTable;
+    const join_table: ?*storage.Table = if (stmt.join) |join| (db.findTable(join.table) orelse return error.UnknownTable) else null;
 
-    const contexts = try collectContexts(temp, db, table, stmt);
+    const contexts = try collectContexts(temp, db, table, join_table, stmt);
     var sorted = try allocator.dupe(RowContext, contexts);
     defer allocator.free(sorted);
     if (stmt.order_by.len != 0) {
@@ -620,14 +625,15 @@ fn selectQuery(allocator: std.mem.Allocator, db: *storage.Storage, stmt: SelectS
     }
 
     if (hasAggregates(stmt.items) or stmt.group_by.len != 0) {
-        return aggregateResult(allocator, temp, table, stmt, sorted);
+        return aggregateResult(allocator, temp, table, join_table, stmt, sorted);
     }
 
-    const column_sample = if (sorted.len > 0) sorted[0] else try emptyContext(temp, table, stmt.table_alias);
+    const column_sample = if (sorted.len > 0) sorted[0] else try emptyContext(temp, table, stmt.table_alias, join_table, if (stmt.join) |join| join.alias else null);
     const columns = try buildResultColumns(allocator, column_sample, stmt.items);
     errdefer allocator.free(columns);
     const offset = if (stmt.limit) |limit| @min(limit.offset, sorted.len) else 0;
-    const end = if (stmt.limit) |limit| @min(sorted.len, offset + limit.count) else sorted.len;
+    const available = sorted.len - offset;
+    const end = offset + @min(if (stmt.limit) |limit| limit.count else available, available);
     var rows = std.array_list.Managed(Row).init(allocator);
     errdefer freeRows(allocator, rows.items);
     for (sorted[offset..end]) |ctx| {
@@ -660,7 +666,7 @@ const RowContext = struct {
     right_row: ?*const storage.Row = null,
 };
 
-fn collectContexts(allocator: std.mem.Allocator, db: *storage.Storage, table: *storage.Table, stmt: SelectStmt) ![]RowContext {
+fn collectContexts(allocator: std.mem.Allocator, db: *storage.Storage, table: *storage.Table, join_table: ?*storage.Table, stmt: SelectStmt) ![]RowContext {
     var out = std.array_list.Managed(RowContext).init(allocator);
     const row_ids_all = try candidateRowsForWhere(allocator, db, table, stmt.conditions, stmt.where_expr);
     for (row_ids_all) |row_id| {
@@ -668,7 +674,7 @@ fn collectContexts(allocator: std.mem.Allocator, db: *storage.Storage, table: *s
         if (left.deleted) continue;
         const base = RowContext{ .left_table = table, .left_alias = stmt.table_alias, .left_row = left };
         if (stmt.join) |join| {
-            const right_table = db.findTable(join.table) orelse return error.UnknownTable;
+            const right_table = join_table.?;
             var matched = false;
             for (right_table.rows.items) |*right| {
                 if (right.deleted) continue;
@@ -844,13 +850,57 @@ fn buildResultColumns(allocator: std.mem.Allocator, sample: ?RowContext, items: 
         switch (item.expr) {
             .star => {
                 const ctx = sample orelse continue;
-                for (ctx.left_table.columns) |col| try columns.append(.{ .name = col.name, .type_code = mysqlType(col.kind) });
-                if (ctx.right_table) |rt| for (rt.columns) |col| try columns.append(.{ .name = col.name, .type_code = mysqlType(col.kind) });
+                for (ctx.left_table.columns) |col| try columns.append(.{ .name = col.name, .type_code = mysqlType(col.kind), .unsigned = col.unsigned });
+                if (ctx.right_table) |rt| for (rt.columns) |col| try columns.append(.{ .name = col.name, .type_code = mysqlType(col.kind), .unsigned = col.unsigned });
             },
-            .expr => |expr| try columns.append(.{ .name = item.alias orelse exprName(expr), .type_code = exprType(expr) }),
+            .expr => |expr| {
+                // A plain column reference must advertise the column's real
+                // type (and unsigned flag). Reporting a generic string makes
+                // clients skip date parsing and mis-decode binary results.
+                var type_code = exprType(expr);
+                var unsigned = false;
+                if (expr.* == .column) {
+                    if (sample) |ctx| {
+                        if (findColumnInContext(ctx, expr.column)) |column| {
+                            type_code = mysqlType(column.kind);
+                            unsigned = column.unsigned;
+                        }
+                    }
+                }
+                try columns.append(.{ .name = item.alias orelse exprName(expr), .type_code = type_code, .unsigned = unsigned });
+            },
         }
     }
     return columns.toOwnedSlice();
+}
+
+/// Resolves a column reference (optionally table-qualified) to its table
+/// definition, without reading a row value. Returns null for ambiguous or
+/// unknown names so callers can fall back to expression typing.
+fn findColumnInContext(ctx: RowContext, name: []const u8) ?*const storage.Column {
+    if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+        const qualifier = name[0..dot];
+        const col = name[dot + 1 ..];
+        if (matchesTable(ctx.left_table, ctx.left_alias, qualifier)) {
+            if (storage.Storage.columnIndex(ctx.left_table, col)) |idx| return &ctx.left_table.columns[idx];
+            return null;
+        }
+        if (ctx.right_table) |rt| {
+            if (matchesTable(rt, ctx.right_alias, qualifier)) {
+                if (storage.Storage.columnIndex(rt, col)) |idx| return &rt.columns[idx];
+            }
+        }
+        return null;
+    }
+    var found: ?*const storage.Column = null;
+    if (storage.Storage.columnIndex(ctx.left_table, name)) |idx| found = &ctx.left_table.columns[idx];
+    if (ctx.right_table) |rt| {
+        if (storage.Storage.columnIndex(rt, name)) |idx| {
+            if (found != null) return null;
+            found = &rt.columns[idx];
+        }
+    }
+    return found;
 }
 
 fn selectNoTable(allocator: std.mem.Allocator, stmt: SelectStmt) !Result {
@@ -919,7 +969,28 @@ fn exprHasAggregate(expr: *const Expr) bool {
     };
 }
 
-fn aggregateResult(allocator: std.mem.Allocator, temp: std.mem.Allocator, table: *const storage.Table, stmt: SelectStmt, contexts: []const RowContext) !Result {
+const AggregateRow = struct {
+    group: AggregateGroup,
+    sample: RowContext,
+    values: []?[]const u8,
+};
+
+const SortAggregateContext = struct {
+    allocator: std.mem.Allocator,
+    orders: []const OrderBy,
+};
+
+fn aggregateRowLessThan(ctx: SortAggregateContext, lhs: AggregateRow, rhs: AggregateRow) bool {
+    for (ctx.orders) |order| {
+        const l = evalExpr(ctx.allocator, lhs.sample, order.expr, lhs.group) catch .null;
+        const r = evalExpr(ctx.allocator, rhs.sample, order.expr, rhs.group) catch .null;
+        const cmp = compareValues(l, r);
+        if (cmp != 0) return if (order.desc) cmp > 0 else cmp < 0;
+    }
+    return false;
+}
+
+fn aggregateResult(allocator: std.mem.Allocator, temp: std.mem.Allocator, table: *const storage.Table, join_table: ?*const storage.Table, stmt: SelectStmt, contexts: []const RowContext) !Result {
     var groups = std.array_list.Managed([]const RowContext).init(temp);
     if (stmt.group_by.len == 0) {
         try groups.append(contexts);
@@ -935,42 +1006,71 @@ fn aggregateResult(allocator: std.mem.Allocator, temp: std.mem.Allocator, table:
         while (it.next()) |list| try groups.append(list.items);
     }
 
-    const column_sample = if (contexts.len > 0) contexts[0] else try emptyContext(temp, table, stmt.table_alias);
+    const right_alias = if (stmt.join) |join| join.alias else null;
+    const column_sample = if (contexts.len > 0) contexts[0] else try emptyContext(temp, table, stmt.table_alias, join_table, right_alias);
     const columns = try buildResultColumns(allocator, column_sample, stmt.items);
     errdefer allocator.free(columns);
-    var rows = std.array_list.Managed(Row).init(allocator);
-    errdefer freeRows(allocator, rows.items);
+
+    // Build every group first so HAVING, ORDER BY, LIMIT and OFFSET are applied
+    // in SQL order. Values are produced in the scratch arena; only the rows that
+    // survive the limit are copied into the result allocator.
+    var built = std.array_list.Managed(AggregateRow).init(temp);
     for (groups.items) |group_contexts| {
         if (group_contexts.len == 0 and stmt.group_by.len != 0) continue;
-        const sample = if (group_contexts.len > 0) group_contexts[0] else try emptyContext(temp, table, stmt.table_alias);
+        const sample = if (group_contexts.len > 0) group_contexts[0] else try emptyContext(temp, table, stmt.table_alias, join_table, right_alias);
         const group = AggregateGroup{ .contexts = group_contexts };
         if (stmt.having) |having| {
             if (!try truthy(try evalExpr(temp, sample, having, group))) continue;
         }
-        var values = try allocator.alloc(?[]const u8, columns.len);
-        errdefer allocator.free(values);
+        const values = try temp.alloc(?[]const u8, columns.len);
         var vi: usize = 0;
         for (stmt.items) |item| {
             switch (item.expr) {
-                .star => vi = try appendStarValues(allocator, sample, values, vi),
+                .star => vi = try appendStarValues(temp, sample, values, vi),
                 .expr => |expr| {
                     const value = try evalExpr(temp, sample, expr, group);
-                    values[vi] = try valueBytes(allocator, value);
+                    values[vi] = try valueBytes(temp, value);
                     vi += 1;
                 },
             }
+        }
+        try built.append(.{ .group = group, .sample = sample, .values = values });
+    }
+
+    if (stmt.order_by.len != 0) {
+        const orders = try temp.alloc(OrderBy, stmt.order_by.len);
+        for (stmt.order_by, 0..) |order, i| {
+            orders[i] = .{ .expr = resolveOrderExpr(stmt, order.expr), .desc = order.desc };
+        }
+        std.sort.insertion(AggregateRow, built.items, SortAggregateContext{ .allocator = temp, .orders = orders }, aggregateRowLessThan);
+    }
+
+    const offset = if (stmt.limit) |limit| @min(limit.offset, built.items.len) else 0;
+    const available = built.items.len - offset;
+    const end = offset + @min(if (stmt.limit) |limit| limit.count else available, available);
+
+    var rows = std.array_list.Managed(Row).init(allocator);
+    errdefer freeRows(allocator, rows.items);
+    for (built.items[offset..end]) |entry| {
+        const values = try allocator.alloc(?[]const u8, columns.len);
+        errdefer allocator.free(values);
+        for (entry.values, 0..) |value, i| {
+            values[i] = if (value) |bytes| try allocator.dupe(u8, bytes) else null;
         }
         try rows.append(.{ .values = values });
     }
     return .{ .kind = .rows, .columns = columns, .rows = try rows.toOwnedSlice() };
 }
 
-fn emptyContext(allocator: std.mem.Allocator, table: *const storage.Table, alias: ?[]const u8) !RowContext {
+/// Builds a synthetic all-NULL row so result metadata is correct even when the
+/// query matches nothing. `right_table` is passed for joins so `SELECT *` still
+/// advertises the joined table's columns on an empty result set.
+fn emptyContext(allocator: std.mem.Allocator, table: *const storage.Table, alias: ?[]const u8, right_table: ?*const storage.Table, right_alias: ?[]const u8) !RowContext {
     const values = try allocator.alloc(storage.Value, table.columns.len);
     @memset(values, .null);
     const row = try allocator.create(storage.Row);
     row.* = .{ .id = 0, .values = values };
-    return .{ .left_table = table, .left_alias = alias, .left_row = row };
+    return .{ .left_table = table, .left_alias = alias, .left_row = row, .right_table = right_table, .right_alias = right_alias, .right_row = null };
 }
 
 fn groupKey(allocator: std.mem.Allocator, ctx: RowContext, exprs: []const *const Expr) ![]const u8 {
@@ -1064,6 +1164,21 @@ fn evalExpr(allocator: std.mem.Allocator, ctx: RowContext, expr: *const Expr, gr
             const left = try evalExpr(allocator, ctx, b.left, group);
             const right = try evalExpr(allocator, ctx, b.right, group);
             if (left == .null or right == .null) break :blk .null;
+            // Keep integer addition/subtraction/multiplication exact. Routing
+            // them through f64 silently loses precision above 2^53.
+            if (b.op != .div) {
+                if (exactInteger(left)) |l| {
+                    if (exactInteger(right)) |r| {
+                        const result = switch (b.op) {
+                            .add => std.math.add(i64, l, r),
+                            .sub => std.math.sub(i64, l, r),
+                            .mul => std.math.mul(i64, l, r),
+                            else => unreachable,
+                        } catch return error.IntegerOutOfRange;
+                        break :blk .{ .int = result };
+                    }
+                }
+            }
             const l = try asReal(left);
             const r = try asReal(right);
             if (b.op == .div and r == 0) break :blk .null;
@@ -1156,6 +1271,10 @@ fn evalCall(allocator: std.mem.Allocator, ctx: RowContext, name: []const u8, arg
         if (args.len != 0) return error.BadFunctionArity;
         return .{ .text = "8.0.46-mysqlzig" };
     }
+    if (std.ascii.eqlIgnoreCase(name, "database") or std.ascii.eqlIgnoreCase(name, "schema")) {
+        if (args.len != 0) return error.BadFunctionArity;
+        return .{ .text = "main" };
+    }
     if (std.ascii.eqlIgnoreCase(name, "now") or std.ascii.eqlIgnoreCase(name, "current_timestamp")) return .{ .datetime = try currentDateTime(allocator) };
     if (std.ascii.eqlIgnoreCase(name, "current_date")) return .{ .date = try currentDate(allocator) };
     if (std.ascii.eqlIgnoreCase(name, "lower") or std.ascii.eqlIgnoreCase(name, "upper")) {
@@ -1236,7 +1355,8 @@ fn truthy(value: storage.Value) !bool {
 
 fn exprName(expr: *const Expr) []const u8 {
     return switch (expr.*) {
-        .column => |name| name,
+        // MySQL labels `SELECT t.col` as `col`, not `t.col`.
+        .column => |name| if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name,
         .aggregate => |agg| if (std.ascii.eqlIgnoreCase(agg.name, "count") and agg.arg == null) "COUNT(*)" else agg.name,
         .call => |call| call.name,
         .literal => |v| literalColumnName(v),
@@ -1405,7 +1525,11 @@ fn showCreateTable(allocator: std.mem.Allocator, db: *storage.Storage, table_nam
             if (bytes) |b| try sql.print(" DEFAULT '{s}'", .{b}) else try sql.appendSlice(" DEFAULT NULL");
         }
         if (col.auto_increment) try sql.appendSlice(" AUTO_INCREMENT");
-        if (col.primary) try sql.appendSlice(" PRIMARY KEY") else if (col.unique) try sql.appendSlice(" UNIQUE");
+        if (col.primary) {
+            // Composite primary keys are rendered once as a table constraint
+            // below; only single-column primary keys belong inline.
+            if (isSingleColumnPrimary(table, i)) try sql.appendSlice(" PRIMARY KEY");
+        } else if (col.unique) try sql.appendSlice(" UNIQUE");
     }
     for (table.indexes.items) |index| {
         const inline_constraint = index.columns.len == 1 and (table.columns[index.columns[0]].primary or table.columns[index.columns[0]].unique);
@@ -1753,11 +1877,29 @@ fn compareOp(left: storage.Value, op: CompareOp, right: storage.Value) bool {
     };
 }
 
+/// Integer-like values must be compared as exact i64: converting them to f64
+/// loses precision above 2^53 and makes distinct 64-bit integers compare equal.
+fn exactInteger(value: storage.Value) ?i64 {
+    return switch (value) {
+        .int => |v| v,
+        .bool => |v| @intFromBool(v),
+        .year => |v| v,
+        else => null,
+    };
+}
+
 fn compareValues(left: storage.Value, right: storage.Value) i8 {
     if (left == .null and right == .null) return 0;
     if (left == .null) return -1;
     if (right == .null) return 1;
     if (bothTextual(left, right)) return compareTextValues(left, right);
+    if (exactInteger(left)) |l| {
+        if (exactInteger(right)) |r| return switch (std.math.order(l, r)) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        };
+    }
     if (numericValue(left)) |l| {
         if (numericValue(right)) |r| return if (l < r) -1 else if (l > r) 1 else 0;
     }
@@ -2007,6 +2149,13 @@ fn enumSetNameAlloc(allocator: std.mem.Allocator, name: []const u8, values: []co
     return out.toOwnedSlice();
 }
 
+fn isSingleColumnPrimary(table: *const storage.Table, column_index: usize) bool {
+    for (table.indexes.items) |index| {
+        if (index.primary and index.columns.len == 1 and index.columns[0] == column_index) return true;
+    }
+    return false;
+}
+
 fn columnHasIndex(table: *const storage.Table, column_index: usize) bool {
     for (table.indexes.items) |index| {
         if (indexContainsColumn(index, column_index)) return true;
@@ -2143,21 +2292,31 @@ fn allDigits(text: []const u8) bool {
 }
 
 fn likeMatch(text: []const u8, pattern: []const u8) bool {
-    return likeMatchAt(text, 0, pattern, 0);
-}
-
-fn likeMatchAt(text: []const u8, ti: usize, pattern: []const u8, pi: usize) bool {
-    if (pi == pattern.len) return ti == text.len;
-    if (pattern[pi] == '%') {
-        var i = ti;
-        while (i <= text.len) : (i += 1) {
-            if (likeMatchAt(text, i, pattern, pi + 1)) return true;
+    // Iterative wildcard match with single-star backtracking. The previous
+    // recursive form was exponential on patterns such as "%a%a%a%" and could
+    // stall the whole server while the storage lock is held.
+    var ti: usize = 0;
+    var pi: usize = 0;
+    var star_pi: ?usize = null;
+    var star_ti: usize = 0;
+    while (ti < text.len) {
+        if (pi < pattern.len and (pattern[pi] == '_' or pattern[pi] == text[ti])) {
+            ti += 1;
+            pi += 1;
+        } else if (pi < pattern.len and pattern[pi] == '%') {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if (star_pi) |star| {
+            pi = star + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
-        return false;
     }
-    if (ti >= text.len) return false;
-    if (pattern[pi] == '_' or pattern[pi] == text[ti]) return likeMatchAt(text, ti + 1, pattern, pi + 1);
-    return false;
+    while (pi < pattern.len and pattern[pi] == '%') pi += 1;
+    return pi == pattern.len;
 }
 
 const sql_parser = @import("sql_parser.zig");
@@ -2705,4 +2864,254 @@ test "insert fills omitted not null columns with implicit defaults" {
     r.deinit(allocator);
 
     try std.testing.expectError(error.NotNullViolation, execute(allocator, &db, "insert into devices (uuid, device) values (null, 'phone')"));
+}
+
+test "integer comparisons are exact beyond double precision" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-bigint-compare-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table bigs (id int primary key, v bigint)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into bigs values (1, 9007199254740992), (2, 9007199254740993)");
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select id from bigs where v = 9007199254740993");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("2", r.rows[0].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select id from bigs where v > 9007199254740992");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("2", r.rows[0].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select id from bigs order by v desc");
+    try std.testing.expectEqualStrings("2", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("1", r.rows[1].values[0].?);
+    r.deinit(allocator);
+}
+
+test "grouped queries honour order by limit and offset" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-group-limit-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table gl (g int)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into gl values (1), (1), (2), (3)");
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select g, count(*) as c from gl group by g order by g limit 2");
+    try std.testing.expectEqual(@as(usize, 2), r.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("2", r.rows[0].values[1].?);
+    try std.testing.expectEqualStrings("2", r.rows[1].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select g, count(*) as c from gl group by g order by g limit 1 offset 1");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("2", r.rows[0].values[0].?);
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select g, count(*) as c from gl group by g order by c desc limit 1");
+    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+    try std.testing.expectEqualStrings("1", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("2", r.rows[0].values[1].?);
+    r.deinit(allocator);
+}
+
+test "left join reports both tables columns when no row matches" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-empty-join-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table la (id int)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "create table lb (id int, name varchar(8))");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into la values (1)");
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select * from la left join lb on la.id = lb.id where 1 = 0");
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), r.columns.len);
+    try std.testing.expectEqual(@as(usize, 0), r.rows.len);
+}
+
+test "composite primary keys render once in show create table" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-composite-pk-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table cpk (a int, b int, primary key (a, b))");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "show create table cpk");
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.rows[0].values[1].?, "PRIMARY KEY"));
+}
+
+test "autoincrement advances past explicitly inserted values" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-autoincrement-advance-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table ai (id int auto_increment primary key, name varchar(8))");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into ai (id, name) values (100, 'x')");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into ai (name) values ('y')");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select id from ai where name = 'y'");
+    defer r.deinit(allocator);
+    try std.testing.expectEqualStrings("101", r.rows[0].values[0].?);
+}
+
+test "changing a column to an existing name is rejected" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-change-column-conflict-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table mc (a int, b int)");
+    r.deinit(allocator);
+    try std.testing.expectError(error.ColumnExists, execute(allocator, &db, "alter table mc change column a b int"));
+    r = try execute(allocator, &db, "select * from mc");
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), r.columns.len);
+}
+
+test "limit offset overflow is clamped" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-limit-overflow-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table lim (id int)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "insert into lim values (1)");
+    r.deinit(allocator);
+    r = try execute(allocator, &db, "select id from lim limit 18446744073709551615 offset 1");
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), r.rows.len);
+}
+
+test "like matching handles wildcards without recursion" {
+    try std.testing.expect(likeMatch("alpha", "a%"));
+    try std.testing.expect(likeMatch("alpha", "%pha"));
+    try std.testing.expect(likeMatch("alpha", "a_pha"));
+    try std.testing.expect(likeMatch("alpha", "%"));
+    try std.testing.expect(likeMatch("", "%"));
+    try std.testing.expect(!likeMatch("", "_"));
+    try std.testing.expect(!likeMatch("alpha", "beta"));
+    try std.testing.expect(!likeMatch("ab", "a%c"));
+    try std.testing.expect(likeMatch("abcabc", "%a%bc"));
+    try std.testing.expect(!likeMatch("abcabd", "%a%bc"));
+    // A pathological pattern that used to recurse exponentially.
+    const pattern = "%a%a%a%a%a%a%a%a%a%a%a%a%b";
+    var text: [512]u8 = undefined;
+    @memset(&text, 'a');
+    try std.testing.expect(!likeMatch(&text, pattern));
+}
+
+test "integer arithmetic stays exact beyond double precision" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-bigint-arithmetic-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "select 9007199254740993 + 0, 9007199254740993 * 1, 9007199254740993 - 1");
+    try std.testing.expectEqualStrings("9007199254740993", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("9007199254740993", r.rows[0].values[1].?);
+    try std.testing.expectEqualStrings("9007199254740992", r.rows[0].values[2].?);
+    r.deinit(allocator);
+    try std.testing.expectError(error.IntegerOutOfRange, execute(allocator, &db, "select 9223372036854775807 + 1"));
+}
+
+test "database and schema functions work alongside other select items" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-database-function-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    const r = try execute(allocator, &db, "select version(), database(), schema()");
+    defer r.deinit(allocator);
+    try std.testing.expectEqualStrings("8.0.46-mysqlzig", r.rows[0].values[0].?);
+    try std.testing.expectEqualStrings("main", r.rows[0].values[1].?);
+    try std.testing.expectEqualStrings("main", r.rows[0].values[2].?);
+}
+
+test "explicit column selects keep type and unsigned metadata" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-column-metadata-test.dump";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var db = try storage.Storage.init(allocator, io, path);
+    defer db.deinit();
+    var r = try execute(allocator, &db, "create table meta (id int unsigned, d date, ts datetime, v bigint)");
+    r.deinit(allocator);
+
+    r = try execute(allocator, &db, "select meta.id, d, ts, v from meta");
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x03), r.columns[0].type_code);
+    try std.testing.expect(r.columns[0].unsigned);
+    try std.testing.expectEqualStrings("id", r.columns[0].name);
+    try std.testing.expectEqual(@as(u8, 0x0a), r.columns[1].type_code);
+    try std.testing.expectEqual(@as(u8, 0x0c), r.columns[2].type_code);
+    try std.testing.expectEqual(@as(u8, 0x08), r.columns[3].type_code);
+    try std.testing.expect(!r.columns[3].unsigned);
 }

@@ -400,6 +400,17 @@ pub const Storage = struct {
         errdefer _ = table.row_index.remove(id);
         table.next_row_id += 1;
         try table.rows.append(.{ .id = id, .values = values });
+        // MySQL advances the auto-increment counter past explicitly supplied
+        // values so later generated ids never collide with or reuse them.
+        for (table.columns, 0..) |col, i| {
+            if (!col.auto_increment) continue;
+            switch (values[i]) {
+                .int => |v| if (v >= 0 and @as(u64, @intCast(v)) >= table.next_row_id) {
+                    table.next_row_id = @as(u64, @intCast(v)) + 1;
+                },
+                else => {},
+            }
+        }
         const row = &table.rows.items[table.rows.items.len - 1];
         for (table.indexes.items) |*index| try indexAdd(index, table, row.values, row.id);
         return id;
@@ -613,8 +624,7 @@ pub const Storage = struct {
         var cur: usize = 32;
         if (!std.mem.eql(u8, bytes[cur .. cur + magic.len], magic)) return error.BadDump;
         cur += magic.len;
-        const table_count = readLe(u32, bytes[cur .. cur + 4]);
-        cur += 4;
+        const table_count = try readLeChecked(u32, bytes, &cur);
 
         var ti: usize = 0;
         while (ti < table_count) : (ti += 1) {
@@ -622,38 +632,32 @@ pub const Storage = struct {
             errdefer arena.deinit();
             const a = arena.allocator();
             const name = try persistBytes(a, try readString(bytes, &cur));
-            const next_row_id = readLe(u64, bytes[cur .. cur + 8]);
-            cur += 8;
-            const col_count = readLe(u32, bytes[cur .. cur + 4]);
-            cur += 4;
+            const next_row_id = try readLeChecked(u64, bytes, &cur);
+            const col_count = try readLeChecked(u32, bytes, &cur);
+            // Each serialized column needs well over one byte, so refusing
+            // counts larger than the remaining input avoids absurd allocations
+            // when a dump is corrupt.
+            if (col_count > bytes.len) return error.BadDump;
             const columns = try self.allocator.alloc(Column, col_count);
             errdefer self.allocator.free(columns);
             for (columns) |*col| {
                 col.name = try persistBytes(a, try readString(bytes, &cur));
                 col.kind = try self.readKind(a, bytes, &cur);
-                if (cur + 6 > bytes.len) return error.BadDump;
-                col.unsigned = bytes[cur] != 0;
-                cur += 1;
-                col.nullable = bytes[cur] != 0;
-                cur += 1;
-                col.auto_increment = bytes[cur] != 0;
-                cur += 1;
-                col.primary = bytes[cur] != 0;
-                cur += 1;
-                col.unique = bytes[cur] != 0;
-                cur += 1;
-                if (bytes[cur] != 0) {
-                    cur += 1;
+                col.unsigned = (try readByteChecked(bytes, &cur)) != 0;
+                col.nullable = (try readByteChecked(bytes, &cur)) != 0;
+                col.auto_increment = (try readByteChecked(bytes, &cur)) != 0;
+                col.primary = (try readByteChecked(bytes, &cur)) != 0;
+                col.unique = (try readByteChecked(bytes, &cur)) != 0;
+                if ((try readByteChecked(bytes, &cur)) != 0) {
                     col.default_value = try self.readPersistedValue(a, bytes, &cur);
                 } else {
-                    cur += 1;
                     col.default_value = null;
                 }
             }
             var checks = std.array_list.Managed(CheckConstraint).init(self.allocator);
             errdefer checks.deinit();
-            const check_count = readLe(u32, bytes[cur .. cur + 4]);
-            cur += 4;
+            const check_count = try readLeChecked(u32, bytes, &cur);
+            if (check_count > bytes.len) return error.BadDump;
             var ci: usize = 0;
             while (ci < check_count) : (ci += 1) {
                 try checks.append(.{
@@ -667,26 +671,21 @@ pub const Storage = struct {
                 for (indexes.items) |*index| index.deinit();
                 indexes.deinit();
             }
-            const index_count = readLe(u32, bytes[cur .. cur + 4]);
-            cur += 4;
+            const index_count = try readLeChecked(u32, bytes, &cur);
+            if (index_count > bytes.len) return error.BadDump;
             var ii: usize = 0;
             while (ii < index_count) : (ii += 1) {
                 const index_name = try persistBytes(a, try readString(bytes, &cur));
-                const index_column_count = readLe(u32, bytes[cur .. cur + 4]);
-                cur += 4;
+                const index_column_count = try readLeChecked(u32, bytes, &cur);
+                if (index_column_count > bytes.len) return error.BadDump;
                 const index_columns = try self.allocator.alloc(usize, index_column_count);
                 defer self.allocator.free(index_columns);
                 for (index_columns) |*column_index| {
-                    if (cur + 4 > bytes.len) return error.BadDump;
-                    column_index.* = readLe(u32, bytes[cur .. cur + 4]);
-                    cur += 4;
+                    column_index.* = try readLeChecked(u32, bytes, &cur);
                     if (column_index.* >= columns.len) return error.BadDump;
                 }
-                if (cur + 2 > bytes.len) return error.BadDump;
-                const unique = bytes[cur] != 0;
-                cur += 1;
-                const primary = bytes[cur] != 0;
-                cur += 1;
+                const unique = (try readByteChecked(bytes, &cur)) != 0;
+                const primary = (try readByteChecked(bytes, &cur)) != 0;
                 try indexes.append(try Index.init(self.allocator, index_name, index_columns, unique, primary));
             }
 
@@ -697,15 +696,12 @@ pub const Storage = struct {
             }
             var row_index = std.AutoHashMap(RowId, usize).init(self.allocator);
             errdefer row_index.deinit();
-            const row_count = readLe(u32, bytes[cur .. cur + 4]);
-            cur += 4;
+            const row_count = try readLeChecked(u32, bytes, &cur);
+            if (row_count > bytes.len) return error.BadDump;
             var ri: usize = 0;
             while (ri < row_count) : (ri += 1) {
-                const id = readLe(u64, bytes[cur .. cur + 8]);
-                cur += 8;
-                if (cur >= bytes.len) return error.BadDump;
-                const deleted = bytes[cur] != 0;
-                cur += 1;
+                const id = try readLeChecked(u64, bytes, &cur);
+                const deleted = (try readByteChecked(bytes, &cur)) != 0;
                 const values = try self.allocator.alloc(Value, col_count);
                 errdefer self.allocator.free(values);
                 for (values) |*value| value.* = try self.readPersistedValue(a, bytes, &cur);
@@ -1200,6 +1196,20 @@ fn readLe(comptime T: type, bytes: []const u8) T {
     return std.mem.readInt(T, bytes[0..@sizeOf(T)], .little);
 }
 
+fn readLeChecked(comptime T: type, bytes: []const u8, cur: *usize) !T {
+    if (cur.* + @sizeOf(T) > bytes.len) return error.BadDump;
+    const value = readLe(T, bytes[cur.* .. cur.* + @sizeOf(T)]);
+    cur.* += @sizeOf(T);
+    return value;
+}
+
+fn readByteChecked(bytes: []const u8, cur: *usize) !u8 {
+    if (cur.* >= bytes.len) return error.BadDump;
+    const value = bytes[cur.*];
+    cur.* += 1;
+    return value;
+}
+
 fn appendString(out: *std.array_list.Managed(u8), bytes: []const u8) !void {
     try appendLe(u32, out, @intCast(bytes.len));
     try out.appendSlice(bytes);
@@ -1305,4 +1315,52 @@ test "unique indexes allow nulls and compare full keys inside hash buckets" {
     const hits = (try storage.indexedLookup(allocator, table, 1, .{ .int = 20 })).?;
     defer allocator.free(hits);
     try std.testing.expectEqualSlices(RowId, &.{second_id}, hits);
+}
+
+test "restore rejects truncated dumps without panicking" {
+    const allocator = std.testing.allocator;
+    const path = "mysqlzig-truncated-dump-test.dump";
+    const trunc_path = "mysqlzig-truncated-dump-test.dump.trunc";
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, trunc_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, trunc_path) catch {};
+
+    {
+        var storage = try Storage.init(allocator, io, path);
+        defer storage.deinit();
+        try storage.createTable("rows", &.{
+            .{ .name = "id", .kind = .int },
+            .{ .name = "name", .kind = .{ .varchar = 16 } },
+        });
+        const table = storage.findTable("rows").?;
+        _ = try storage.insertRow(table, &.{ .{ .int = 1 }, .{ .text = "alpha" } });
+        _ = try storage.insertRow(table, &.{ .{ .int = 2 }, .{ .text = "beta" } });
+        try storage.flush();
+    }
+
+    const original = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
+    defer allocator.free(original);
+    try std.testing.expect(original.len > 33);
+
+    var cut: usize = 32;
+    while (cut < original.len) : (cut += 13) {
+        const body = original[32..cut];
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(body, &hash, .{});
+        var file = try std.Io.Dir.cwd().createFile(io, trunc_path, .{ .truncate = true });
+        try file.writeStreamingAll(io, &hash);
+        try file.writeStreamingAll(io, body);
+        file.close(io);
+
+        if (Storage.init(allocator, io, trunc_path)) |storage_value| {
+            var storage = storage_value;
+            storage.deinit();
+            std.debug.print("truncated dump at {d}/{d} restored unexpectedly\n", .{ cut, original.len });
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
 }

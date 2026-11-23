@@ -149,26 +149,7 @@ pub const Connection = struct {
         try self.writeRaw(self.sequence, col_count.items);
         self.sequence +%= 1;
 
-        for (result.columns) |col| {
-            var desc = std.array_list.Managed(u8).init(self.allocator);
-            defer desc.deinit();
-            try appendLenEncString(&desc, "def");
-            try appendLenEncString(&desc, "");
-            try appendLenEncString(&desc, "");
-            try appendLenEncString(&desc, "");
-            try appendLenEncString(&desc, col.name);
-            try appendLenEncString(&desc, col.name);
-            try desc.append(0x0c);
-            try appendLe(u16, &desc, charset_utf8mb4_general_ci);
-            try appendLe(u32, &desc, 1024);
-            try desc.append(col.type_code);
-            try appendLe(u16, &desc, 0);
-            try desc.append(0);
-            try desc.append(0);
-            try self.writeRaw(self.sequence, desc.items);
-            self.sequence +%= 1;
-        }
-
+        for (result.columns) |col| try self.writeColumnDefinition(col);
         try self.writeEof();
 
         for (result.rows) |row| {
@@ -211,7 +192,7 @@ pub const Connection = struct {
             try payload.appendNTimes(0, null_bitmap_len);
             for (row.values, 0..) |value, i| {
                 if (value) |bytes| {
-                    try appendBinaryValue(&payload, result.columns[i].type_code, bytes);
+                    try appendBinaryValue(&payload, result.columns[i].type_code, bytes, result.columns[i].unsigned);
                 } else {
                     payload.items[null_bitmap_start + ((i + 2) / 8)] |= @as(u8, 1) << @intCast((i + 2) & 7);
                 }
@@ -264,7 +245,9 @@ pub const Connection = struct {
         try appendLe(u16, &desc, charset_utf8mb4_general_ci);
         try appendLe(u32, &desc, 1024);
         try desc.append(col.type_code);
-        try appendLe(u16, &desc, 0);
+        // field flags: UNSIGNED_FLAG (0x0020) lets clients decode the value as
+        // an unsigned integer instead of a signed one.
+        try appendLe(u16, &desc, if (col.unsigned) 0x0020 else 0);
         try desc.append(0);
         try desc.append(0);
         try self.writeRaw(self.sequence, desc.items);
@@ -339,7 +322,9 @@ fn buildHandshake(allocator: std.mem.Allocator, nonce: *const [20]u8) ![]u8 {
 }
 
 fn parseHandshakeResponse(payload: []const u8) !HandshakeResponse {
-    if (payload.len < 36) return error.MalformedHandshakeResponse;
+    // Fixed 4.1 response prefix: capability flags, max packet size, charset,
+    // and 23 reserved bytes. A username follows, so anything shorter is invalid.
+    if (payload.len < 32) return error.MalformedHandshakeResponse;
     const capabilities = readLe(u32, payload[0..4]);
     var cursor: usize = 32;
     const username_end = std.mem.indexOfScalarPos(u8, payload, cursor, 0) orelse return error.MalformedHandshakeResponse;
@@ -387,14 +372,16 @@ fn fillNonce(io: std.Io, nonce: *[20]u8) void {
 fn verifyCachingSha2(password: []const u8, nonce: *const [20]u8, token: []const u8) bool {
     if (password.len == 0) return true;
     if (token.len != 32) return false;
+    // MySQL's fast-auth scramble is
+    //   SHA256(password) XOR SHA256(SHA256(password) + nonce).
+    // Note the inner mix uses the *second* hash; hashing once more yields a
+    // token that no real client ever sends.
     var s1: [32]u8 = undefined;
     var s2: [32]u8 = undefined;
-    var s3: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(password, &s1, .{});
     std.crypto.hash.sha2.Sha256.hash(&s1, &s2, .{});
-    std.crypto.hash.sha2.Sha256.hash(&s2, &s3, .{});
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update(&s3);
+    h.update(&s2);
     h.update(nonce);
     var scramble: [32]u8 = undefined;
     h.final(&scramble);
@@ -456,20 +443,36 @@ fn appendLenEncString(out: *std.array_list.Managed(u8), bytes: []const u8) !void
     try out.appendSlice(bytes);
 }
 
-fn appendBinaryValue(out: *std.array_list.Managed(u8), type_code: u8, bytes: []const u8) !void {
+fn appendBinaryValue(out: *std.array_list.Managed(u8), type_code: u8, bytes: []const u8, unsigned: bool) !void {
     switch (type_code) {
-        0x01 => try out.append(@intCast(try std.fmt.parseInt(i8, bytes, 10))),
+        0x01 => {
+            // TINY: MySQL writes a single byte; an unsigned column stores up to 255.
+            if (unsigned) {
+                try out.append(try std.fmt.parseInt(u8, bytes, 10));
+            } else {
+                try out.append(@bitCast(try std.fmt.parseInt(i8, bytes, 10)));
+            }
+        },
         0x02, 0x0d => {
-            const value = try std.fmt.parseInt(i16, bytes, 10);
-            try appendLe(i16, out, value);
+            if (unsigned) {
+                try appendLe(u16, out, try std.fmt.parseInt(u16, bytes, 10));
+            } else {
+                try appendLe(i16, out, try std.fmt.parseInt(i16, bytes, 10));
+            }
         },
         0x03, 0x09 => {
-            const value = try std.fmt.parseInt(i32, bytes, 10);
-            try appendLe(i32, out, value);
+            if (unsigned) {
+                try appendLe(u32, out, try std.fmt.parseInt(u32, bytes, 10));
+            } else {
+                try appendLe(i32, out, try std.fmt.parseInt(i32, bytes, 10));
+            }
         },
         0x08 => {
-            const value = try std.fmt.parseInt(i64, bytes, 10);
-            try appendLe(i64, out, value);
+            if (unsigned) {
+                try appendLe(u64, out, try std.fmt.parseInt(u64, bytes, 10));
+            } else {
+                try appendLe(i64, out, try std.fmt.parseInt(i64, bytes, 10));
+            }
         },
         0x04 => {
             const value = try std.fmt.parseFloat(f32, bytes);
@@ -479,8 +482,87 @@ fn appendBinaryValue(out: *std.array_list.Managed(u8), type_code: u8, bytes: []c
             const value = try std.fmt.parseFloat(f64, bytes);
             try appendLe(u64, out, @bitCast(value));
         },
+        0x0a => try appendBinaryDate(out, bytes),
+        0x07, 0x0c => try appendBinaryDateTime(out, bytes),
+        0x0b => try appendBinaryTime(out, bytes),
         else => try appendLenEncString(out, bytes),
     }
+}
+
+// The binary protocol sends temporal values as length-prefixed binary structs,
+// not text. Clients (go-sql-driver, mysql-connector, ...) decode them with
+// fixed layouts, so text-encoding dates desynchronizes their row parsers.
+fn appendBinaryDate(out: *std.array_list.Managed(u8), bytes: []const u8) !void {
+    const parts = parseTemporalParts(bytes) orelse {
+        try out.append(0);
+        return;
+    };
+    try out.append(4);
+    try appendLe(u16, out, parts.year);
+    try out.append(parts.month);
+    try out.append(parts.day);
+}
+
+fn appendBinaryDateTime(out: *std.array_list.Managed(u8), bytes: []const u8) !void {
+    const parts = parseTemporalParts(bytes) orelse {
+        try out.append(0);
+        return;
+    };
+    try out.append(7);
+    try appendLe(u16, out, parts.year);
+    try out.append(parts.month);
+    try out.append(parts.day);
+    try out.append(parts.hour);
+    try out.append(parts.minute);
+    try out.append(parts.second);
+}
+
+fn appendBinaryTime(out: *std.array_list.Managed(u8), bytes: []const u8) !void {
+    if (bytes.len != 8) {
+        try out.append(0);
+        return;
+    }
+    const hour = std.fmt.parseInt(u8, bytes[0..2], 10) catch {
+        try out.append(0);
+        return;
+    };
+    const minute = std.fmt.parseInt(u8, bytes[3..5], 10) catch {
+        try out.append(0);
+        return;
+    };
+    const second = std.fmt.parseInt(u8, bytes[6..8], 10) catch {
+        try out.append(0);
+        return;
+    };
+    try out.append(8);
+    try out.append(0); // is_negative
+    try appendLe(u32, out, 0); // days
+    try out.append(hour);
+    try out.append(minute);
+    try out.append(second);
+}
+
+const TemporalParts = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8 = 0,
+    minute: u8 = 0,
+    second: u8 = 0,
+};
+
+fn parseTemporalParts(bytes: []const u8) ?TemporalParts {
+    if (bytes.len != 10 and bytes.len != 19) return null;
+    const year = std.fmt.parseInt(u16, bytes[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u8, bytes[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, bytes[8..10], 10) catch return null;
+    var parts = TemporalParts{ .year = year, .month = month, .day = day };
+    if (bytes.len == 19) {
+        parts.hour = std.fmt.parseInt(u8, bytes[11..13], 10) catch return null;
+        parts.minute = std.fmt.parseInt(u8, bytes[14..16], 10) catch return null;
+        parts.second = std.fmt.parseInt(u8, bytes[17..19], 10) catch return null;
+    }
+    return parts;
 }
 
 const LenEnc = struct { value: usize, next: usize };
@@ -505,21 +587,71 @@ fn readLenEncInt(bytes: []const u8, start: usize) !LenEnc {
     return error.MalformedLengthEncodedInteger;
 }
 
-test "caching_sha2_password verifier accepts generated token" {
-    const password = "secret";
-    const nonce: [20]u8 = "abcdefghijklmnopqrst".*;
+test "caching_sha2_password verifier accepts a real client token" {
+    // Captured from mysql 9.3.0 (Oracle client) during a fast-auth handshake:
+    // nonce and the 32-byte token it sent for password "secret".
+    const nonce: [20]u8 = .{
+        0x61, 0xb3, 0x05, 0xf2, 0xe4, 0x2e, 0xb2, 0x31, 0xf7, 0x43,
+        0x2c, 0xee, 0xf5, 0x32, 0xeb, 0x1c, 0x5b, 0x70, 0x8d, 0xee,
+    };
+    const token: [32]u8 = .{
+        0x52, 0x2f, 0x60, 0x79, 0x2d, 0x3a, 0x1b, 0xe3, 0x63, 0x0b, 0x66, 0xa1, 0x6d, 0xc0, 0x22, 0xaa,
+        0x5a, 0x79, 0x15, 0x5a, 0x7e, 0xa8, 0x48, 0x58, 0xa4, 0xe7, 0x43, 0xac, 0x69, 0x4f, 0xf8, 0x0c,
+    };
+    try std.testing.expect(verifyCachingSha2("secret", &nonce, &token));
+    try std.testing.expect(!verifyCachingSha2("other", &nonce, &token));
+
+    // The same formula must work for any nonce; generate one and round-trip it.
+    const round_nonce: [20]u8 = "abcdefghijklmnopqrst".*;
     var s1: [32]u8 = undefined;
     var s2: [32]u8 = undefined;
-    var s3: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(password, &s1, .{});
+    std.crypto.hash.sha2.Sha256.hash("secret", &s1, .{});
     std.crypto.hash.sha2.Sha256.hash(&s1, &s2, .{});
-    std.crypto.hash.sha2.Sha256.hash(&s2, &s3, .{});
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update(&s3);
-    h.update(&nonce);
+    h.update(&s2);
+    h.update(&round_nonce);
     var scramble: [32]u8 = undefined;
     h.final(&scramble);
-    var token: [32]u8 = undefined;
-    for (&token, 0..) |*b, i| b.* = s1[i] ^ scramble[i];
-    try std.testing.expect(verifyCachingSha2(password, &nonce, &token));
+    var round_token: [32]u8 = undefined;
+    for (&round_token, 0..) |*b, i| b.* = s1[i] ^ scramble[i];
+    try std.testing.expect(verifyCachingSha2("secret", &round_nonce, &round_token));
+}
+
+test "minimal handshake response without plugin auth parses" {
+    // 32-byte fixed prefix + "r" + NUL username + NUL empty auth response.
+    var payload = [_]u8{0} ** 35;
+    payload[8] = charset_utf8mb4_general_ci;
+    payload[32] = 'r';
+    payload[33] = 0;
+    payload[34] = 0;
+    const parsed = try parseHandshakeResponse(&payload);
+    try std.testing.expectEqualStrings("r", parsed.username);
+    try std.testing.expectEqualStrings("", parsed.auth_response);
+    try std.testing.expectEqualStrings(auth_plugin_caching_sha2, parsed.plugin);
+}
+
+test "binary protocol encodes temporal values as binary structs" {
+    var out = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer out.deinit();
+    try appendBinaryValue(&out, 0x0a, "2026-11-23", false);
+    try std.testing.expectEqualSlices(u8, &.{ 4, 0xea, 0x07, 11, 23 }, out.items);
+
+    out.clearRetainingCapacity();
+    try appendBinaryValue(&out, 0x0c, "2026-11-23 09:52:07", false);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 0xea, 0x07, 11, 23, 9, 52, 7 }, out.items);
+
+    out.clearRetainingCapacity();
+    try appendBinaryValue(&out, 0x0b, "12:34:56", false);
+    try std.testing.expectEqualSlices(u8, &.{ 8, 0, 0, 0, 0, 0, 12, 34, 56 }, out.items);
+
+    // Unsigned integers must not be truncated to their signed width.
+    out.clearRetainingCapacity();
+    try appendBinaryValue(&out, 0x01, "200", true);
+    try std.testing.expectEqualSlices(u8, &.{200}, out.items);
+    out.clearRetainingCapacity();
+    try appendBinaryValue(&out, 0x03, "4294967295", true);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, out.items);
+    out.clearRetainingCapacity();
+    try appendBinaryValue(&out, 0x08, "18446744073709551615", true);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, out.items);
 }
