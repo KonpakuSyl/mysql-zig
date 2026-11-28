@@ -2428,6 +2428,12 @@ test "sql small app completeness features" {
         try std.testing.expectEqual(@as(usize, 1), r.rows.len);
         try std.testing.expectEqualStrings("index", r.rows[0].values[0].?);
         r.deinit(allocator);
+        r = try execute(allocator, &db, "ALTER TABLE `rare_mine_1` ADD `super_monster_level` int;");
+        r.deinit(allocator);
+        r = try execute(allocator, &db, "show columns from game_p602_local.rare_mine_1 where Field = 'super_monster_level'");
+        try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+        try std.testing.expectEqualStrings("super_monster_level", r.rows[0].values[0].?);
+        r.deinit(allocator);
         r = try execute(allocator, &db, "show indexes from `rare_mine_1` from `main` where Key_name = 'layer_index'");
         try std.testing.expectEqual(@as(usize, 0), r.rows.len);
         r.deinit(allocator);

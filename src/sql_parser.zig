@@ -58,6 +58,8 @@ pub const TokenKind = enum {
 pub const Token = struct {
     kind: TokenKind,
     text: []const u8,
+    table_component: ?[]const u8 = null,
+    quoted: bool = false,
 };
 
 pub fn tokenize(allocator: std.mem.Allocator, input: []const u8) ![]Token {
@@ -136,7 +138,7 @@ pub fn tokenize(allocator: std.mem.Allocator, input: []const u8) ![]Token {
             },
             '`' => {
                 const parsed = try parseQuotedIdentifierPath(allocator, input, i);
-                try tokens.append(.{ .kind = .ident, .text = parsed.text });
+                try tokens.append(.{ .kind = .ident, .text = parsed.text, .table_component = parsed.last_component, .quoted = true });
                 i = parsed.next;
             },
             '@' => {
@@ -155,7 +157,9 @@ pub fn tokenize(allocator: std.mem.Allocator, input: []const u8) ![]Token {
                     const start = i;
                     i += 1;
                     while (i < input.len and isIdentContinue(input[i])) i += 1;
-                    try tokens.append(.{ .kind = .ident, .text = input[start..i] });
+                    const name = input[start..i];
+                    const dot = std.mem.indexOfScalar(u8, name, '.');
+                    try tokens.append(.{ .kind = .ident, .text = name, .table_component = if (dot) |pos| name[pos + 1 ..] else null });
                 } else return error.BadToken;
             },
         }
@@ -166,7 +170,9 @@ pub fn tokenize(allocator: std.mem.Allocator, input: []const u8) ![]Token {
 
 const ParsedString = struct { text: []const u8, next: usize };
 
-fn parseQuotedIdentifierPath(allocator: std.mem.Allocator, input: []const u8, start_quote: usize) !ParsedString {
+const IdentifierPath = struct { text: []const u8, last_component: []const u8, next: usize };
+
+fn parseQuotedIdentifierPath(allocator: std.mem.Allocator, input: []const u8, start_quote: usize) !IdentifierPath {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var i = start_quote;
@@ -179,10 +185,11 @@ fn parseQuotedIdentifierPath(allocator: std.mem.Allocator, input: []const u8, st
         if (out.items.len != 0) try out.append('.');
         try out.appendSlice(input[start..i]);
         i += 1;
-        if (i + 1 >= input.len or input[i] != '.' or input[i + 1] != '`') break;
+        if (i + 1 >= input.len or input[i] != '.' or input[i + 1] != '`') {
+            return .{ .text = try out.toOwnedSlice(), .last_component = input[start .. i - 1], .next = i };
+        }
         i += 1;
     }
-    return .{ .text = try out.toOwnedSlice(), .next = i };
 }
 
 fn parseStringLiteral(allocator: std.mem.Allocator, input: []const u8, start_quote: usize) !ParsedString {
@@ -449,16 +456,15 @@ pub const Parser = struct {
                 try self.expect(.eof);
                 return .{ .alter_table = .{ .table = table, .action = .{ .add_check = check } } };
             }
-            if (self.matchKeyword("column")) {
-                const col = try self.parseColumnDefinition();
-                try self.expect(.eof);
-                return .{ .alter_table = .{ .table = table, .action = .{ .add_column = col } } };
-            }
             if (self.peekKeyword("primary") or self.peekKeyword("unique") or self.looksLikeIndexConstraint()) {
                 const index = try self.parseTableConstraint();
                 try self.expect(.eof);
                 return .{ .alter_table = .{ .table = table, .action = .{ .add_index = index } } };
             }
+            _ = self.matchKeyword("column");
+            const col = try self.parseColumnDefinition();
+            try self.expect(.eof);
+            return .{ .alter_table = .{ .table = table, .action = .{ .add_column = col } } };
         }
         if (self.matchKeyword("drop")) {
             if (self.matchKeyword("primary")) {
@@ -567,7 +573,9 @@ pub const Parser = struct {
         }
         if (self.matchKeyword("columns") or self.matchKeyword("fields")) {
             try self.expectKeyword("from");
-            const table = try self.expectIdentLike();
+            const component = self.peek().table_component;
+            const name = try self.expectIdentLike();
+            const table = component orelse name;
             _ = try self.parseOptionalFromDatabase();
             var field: ?[]const u8 = null;
             if (self.matchKeyword("where")) {
@@ -1156,14 +1164,14 @@ pub const Parser = struct {
 
     fn matchKeyword(self: *Parser, keyword: []const u8) bool {
         const tok = self.peek();
-        if (tok.kind != .ident or !std.ascii.eqlIgnoreCase(tok.text, keyword)) return false;
+        if (tok.kind != .ident or tok.quoted or !std.ascii.eqlIgnoreCase(tok.text, keyword)) return false;
         self.index += 1;
         return true;
     }
 
     fn peekKeyword(self: *Parser, keyword: []const u8) bool {
         const tok = self.peek();
-        return tok.kind == .ident and std.ascii.eqlIgnoreCase(tok.text, keyword);
+        return tok.kind == .ident and !tok.quoted and std.ascii.eqlIgnoreCase(tok.text, keyword);
     }
 
     fn match(self: *Parser, kind: TokenKind) bool {
